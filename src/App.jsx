@@ -34,6 +34,14 @@ const TARGETS = {
 
 const ALL_BASES = [...BASES.north, ...BASES.south];
 const THREAT_TYPES = ["Ballistic missile", "Strike aircraft", "Cruise missile", "Armed drone", "Fighter jet"];
+
+// Naval ships — positioned in the Boreal Passage (open sea between island groups)
+const SHIPS = [
+  { id: "SNS-1", name: "SNS Ironclad",  x_km: 180,  y_km: 700, ...toSVG(180,  700) },
+  { id: "SNS-2", name: "SNS Resolute",  x_km: 700,  y_km: 670, ...toSVG(700,  670) },
+  { id: "SNS-3", name: "SNS Vigilant",  x_km: 1250, y_km: 640, ...toSVG(1250, 640) },
+];
+const SHIP_SAM_RANGE_SVG = 220 * SCALE_Y;  // 220km in SVG pixels
 let threatCounter = 1;
 
 // Radar stations — on the three north-passage islands in the Boreal Passage
@@ -174,6 +182,7 @@ export default function App() {
   const [tab,              setTab]              = useState("feed");
   const [showRanges,       setShowRanges]       = useState(false);
   const [aircraftStatus,   setAircraftStatus]   = useState([]);
+  const [shipStatus,       setShipStatus]       = useState(SHIPS.map(s => ({ ...s, sam_count: 10 })));
   const [threatenedTargets,setThreatenedTargets]= useState(new Set());
   const [overrideBase,       setOverrideBase]       = useState({});
   const [waveLog,            setWaveLog]            = useState([]);
@@ -198,25 +207,40 @@ export default function App() {
   const spyInPassageRef    = useRef(false);        // true when a spy aircraft is in the radar zone
 
   // Speed in SVG px/frame
-  const INTERCEPT_SPEED = { fighter: 1.4, interceptor: 1.8, drone: 0.8 };
+  const INTERCEPT_SPEED = { fighter: 1.4, interceptor: 1.8, drone: 0.8, ship_sam: 2.0, ship_ciws: 2.8, ground_defense: 1.6 };
 
   const spawnInterceptor = (decision, threatObj) => {
-    const base = BASES.north.find(b => b.id === decision.recommended_base);
-    if (!base) return;
-    // Use the threat's CURRENT position if we have it, otherwise fall back to spawn position
+    const assetType = decision.recommended_asset_type || "fighter";
+    const platformId = decision.recommended_base;
     const tid = decision.threat_id;
     const cur = (tid && threatPosRef.current[tid]) || { x: threatObj?.x ?? 500, y: threatObj?.y ?? 650 };
-    const dx = cur.x - base.x, dy = cur.y - base.y;
+
+    // Find launch origin: north base → ship → ground strip → nearest base fallback
+    let origin = BASES.north.find(b => b.id === platformId)
+              || SHIPS.find(s => s.id === platformId)
+              || BASES.north.find(b => platformId?.startsWith(b.id));
+
+    // Hard fallback: nearest north base to the threat (never silently bail)
+    if (!origin) {
+      origin = [...BASES.north].sort((a, b) => {
+        const da = Math.hypot(a.x - cur.x, a.y - cur.y);
+        const db = Math.hypot(b.x - cur.x, b.y - cur.y);
+        return da - db;
+      })[0];
+    }
+    if (!origin) return;
+
+    const dx = cur.x - origin.x, dy = cur.y - origin.y;
     const len = Math.sqrt(dx*dx + dy*dy) || 1;
-    const spd = INTERCEPT_SPEED[decision.recommended_asset_type] || 1.4;
-    setInterceptors(p => [...p.slice(-12), {
+    const spd = INTERCEPT_SPEED[assetType] || 1.4;
+    setInterceptors(p => [...p.slice(-14), {
       id: `icp-${decision.decision_id}-${Date.now()}`,
-      assetType: decision.recommended_asset_type || "fighter",
+      assetType,
       weapon: decision.recommended_weapon || "",
-      x: base.x, y: base.y,
+      x: origin.x, y: origin.y,
       vx: (dx/len)*spd, vy: (dy/len)*spd,
       targetId: tid,
-      baseId: decision.recommended_base,
+      baseId: platformId || origin.id,
       age: 0,
     }]);
   };
@@ -256,6 +280,8 @@ export default function App() {
     const fetch_ = () =>
       fetch(`${API}/state/aircraft`).then(r => r.json())
         .then(d => { if (d.bases) setAircraftStatus(d.bases); }).catch(() => {});
+      fetch(`${API}/state/summary`).then(r => r.json())
+        .then(d => { if (d.ships) setShipStatus(d.ships); }).catch(() => {});
     fetch_();
     const iv = setInterval(fetch_, 5000);
     return () => clearInterval(iv);
@@ -411,7 +437,8 @@ export default function App() {
             const ddx = th.x - rad.x, ddy = th.y - rad.y;
             if (Math.sqrt(ddx*ddx + ddy*ddy) <= rad.range_svg) {
               decidedThreatsRef.current.add(th.id);
-              nowDetected.push({ ...th });
+              // Overwrite stale spawn km coords with current SVG-derived position
+              nowDetected.push({ ...th, x_km: th.x / SCALE_X, y_km: th.y / SCALE_Y });
               break;
             }
           }
@@ -882,6 +909,38 @@ export default function App() {
               </g>
             ))}
 
+            {/* Naval ships — in the Boreal Passage */}
+            {shipStatus.map(ship => {
+              const depleted = ship.sam_count === 0;
+              const col = depleted ? "#f87171" : "#38bdf8";
+              return (
+                <g key={ship.id} opacity={dim ? 0.15 : 1}>
+                  {/* SAM range ring — only when showRanges is on */}
+                  {showRanges && (
+                    <circle cx={ship.x} cy={ship.y} r={SHIP_SAM_RANGE_SVG} fill="none"
+                      stroke={col} strokeWidth="0.5" strokeDasharray="5 4" opacity="0.18" />
+                  )}
+                  {/* Ship hull — flat rectangle */}
+                  <rect x={ship.x - 10} y={ship.y - 4} width="20" height="8"
+                    fill={col} fillOpacity="0.18" stroke={col} strokeWidth="1" rx="2" />
+                  {/* Mast */}
+                  <line x1={ship.x} y1={ship.y - 4} x2={ship.x} y2={ship.y - 10}
+                    stroke={col} strokeWidth="1" opacity="0.8" />
+                  {/* SAM launcher dots */}
+                  {!depleted && [0,1,2].map(i => (
+                    <circle key={i} cx={ship.x - 5 + i * 5} cy={ship.y - 2} r="1.2"
+                      fill={col} opacity="0.7" />
+                  ))}
+                  <text x={ship.x} y={ship.y + 16} fill={col} fontSize="6.5"
+                    textAnchor="middle" opacity="0.85">{ship.name}</text>
+                  <text x={ship.x} y={ship.y + 24} fill={depleted ? "#f87171" : "rgba(56,189,248,0.6)"}
+                    fontSize="6" textAnchor="middle">
+                    {depleted ? "NO SAMs" : `${ship.sam_count} SAMs`}
+                  </text>
+                </g>
+              );
+            })}
+
             {/* Civilians + spy flights */}
             {civilians.map(c => c.isSpy ? (
               <g key={c.id} transform={`translate(${c.x},${c.y})`} opacity={dim ? 0.15 : 1}>
@@ -902,26 +961,38 @@ export default function App() {
               </g>
             ))}
 
-            {/* Interceptor vehicles — friendly assets in flight */}
+            {/* Interceptor vehicles — aircraft, ship SAMs, and ground fire */}
             {interceptors.map(icp => {
               const angle = Math.atan2(icp.vy, icp.vx) * 180 / Math.PI + 90;
               const isHl  = hl?.baseId === icp.baseId;
-              const iconType = icp.assetType === "interceptor" ? "Cruise missile"
-                             : icp.assetType === "drone"       ? "Armed drone"
+              const isShip   = icp.assetType === "ship_sam";
+              const isCIWS   = icp.assetType === "ship_ciws";
+              const isGround = icp.assetType === "ground_defense";
+              const col = isCIWS ? "#fb923c" : isShip ? "#38bdf8" : isGround ? "#facc15" : "#3fc1ff";
+              const iconType = icp.assetType === "interceptor"    ? "Cruise missile"
+                             : icp.assetType === "drone"           ? "Armed drone"
+                             : icp.assetType === "ship_sam"        ? "Ballistic missile"
+                             : icp.assetType === "ship_ciws"       ? "Cruise missile"
+                             : icp.assetType === "ground_defense"  ? "Cruise missile"
                              : "Strike aircraft";
               const trail = Math.min(icp.age * 0.4, 12);
               return (
                 <g key={icp.id} transform={`translate(${icp.x},${icp.y})`}
                   opacity={dim && !isHl ? 0.15 : 1} style={{ transition: "opacity 0.2s" }}>
-                  {/* Engine exhaust trail */}
-                  <line x1={0} y1={0} x2={-icp.vx * trail} y2={-icp.vy * trail}
-                    stroke="#3fc1ff" strokeWidth="1.5" opacity="0.35" strokeLinecap="round" />
-                  {/* Glow */}
-                  <circle r="8" fill="none" stroke="#3fc1ff" strokeWidth="0.5" opacity="0.2" />
-                  {/* Vehicle icon in friendly blue */}
-                  <ThreatIcon type={iconType} color="#3fc1ff" angle={angle} />
-                  {/* Weapon label */}
-                  <text y="-15" fill="rgba(63,193,255,0.6)" fontSize="6" textAnchor="middle">{icp.baseId}</text>
+                  {/* CIWS: rapid tracer bursts instead of a single trail */}
+                  {isCIWS ? [0,1,2,3].map(i => (
+                    <line key={i} x1={i*2} y1={0} x2={-icp.vx*(trail+i*2)} y2={-icp.vy*(trail+i*2)}
+                      stroke={col} strokeWidth="1.5" opacity={0.6 - i*0.12} strokeLinecap="round" />
+                  )) : (
+                    <line x1={0} y1={0} x2={-icp.vx * trail} y2={-icp.vy * trail}
+                      stroke={col} strokeWidth={isShip || isGround ? 2 : 1.5} opacity="0.4" strokeLinecap="round" />
+                  )}
+                  <circle r="8" fill="none" stroke={col} strokeWidth="0.5" opacity="0.2" />
+                  {!isCIWS && <ThreatIcon type={iconType} color={col} angle={angle} />}
+                  {isCIWS && <circle r="3" fill={col} opacity="0.9" />}
+                  <text y="-15" fill={`${col}99`} fontSize="6" textAnchor="middle">
+                    {isCIWS ? "CIWS" : isShip ? "SAM" : isGround ? "GND" : icp.baseId}
+                  </text>
                 </g>
               );
             })}
