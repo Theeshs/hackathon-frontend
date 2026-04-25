@@ -62,15 +62,18 @@ function spawnTowardTarget(spawnX, spawnY, target, type) {
   const dx = target.x - spawnX;
   const dy = target.y - spawnY;
   const len = Math.sqrt(dx * dx + dy * dy);
-  const animSpd = 0.28 + Math.random() * 0.18;  // ~20-30s to reach target at 60fps
+  const animSpd = 0.28 + Math.random() * 0.18;  // px/frame at 60fps → ~20-30s to reach target
   const id = `T${String(threatCounter++).padStart(3, "0")}`;
 
-  // Real-world speed and ETA from km coordinates
+  // Real-world speed and ETA (sent to backend AI for reasoning)
   const speed_km_h = Math.floor(600 + Math.random() * 900);
   const dx_km = target.x_km - spawnX / SCALE_X;
   const dy_km = target.y_km - spawnY / SCALE_Y;
   const dist_km = Math.sqrt(dx_km ** 2 + dy_km ** 2);
   const eta_seconds = Math.round(dist_km / speed_km_h * 3600);
+
+  // Animation-scale ETA — used for on-screen countdown (sim runs ~100x faster than real-world)
+  const anim_eta_s = Math.round(len / animSpd / 60);
 
   return {
     id, type,
@@ -83,6 +86,7 @@ function spawnTowardTarget(spawnX, spawnY, target, type) {
     speed: speed_km_h,
     heading: Math.round((Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360),
     eta: eta_seconds,
+    anim_eta_s,   // simulation countdown for HOLD cards
     classification: "HOSTILE",
     civilian_nearby: Math.random() > 0.78,
     detected: false,
@@ -195,6 +199,9 @@ export default function App() {
   const [overrideBase,       setOverrideBase]       = useState({});
   const [waveLog,            setWaveLog]            = useState([]);
   const [forecast,           setForecast]           = useState(null);
+  const [campaignActive,     setCampaignActive]     = useState(false);
+  const [nextWaveIn,         setNextWaveIn]         = useState(null);   // seconds countdown to next wave
+  const [campaignWaveNum,    setCampaignWaveNum]    = useState(0);      // 1-3, current wave in campaign
   const [hoveredId,          setHoveredId]          = useState(null);
   const [expandedReasoning,  setExpandedReasoning]  = useState(new Set());
   const [sessionCost,        setSessionCost]        = useState(0);
@@ -336,7 +343,7 @@ export default function App() {
 
   // No auto-approve — HOLD items stay until the human explicitly approves or rejects
 
-  // Fetch wave forecast whenever waveLog changes (debounced to 30s minimum)
+  // Fetch wave forecast whenever waveLog changes
   useEffect(() => {
     if (waveLog.length === 0) return;
     const logWithNow = waveLog.map(w => ({ ...w, now: Date.now() }));
@@ -345,6 +352,13 @@ export default function App() {
       body: JSON.stringify({ wave_log: logWithNow, base_count: aircraftStatus.length }),
     }).then(r => r.json()).then(setForecast).catch(() => {});
   }, [waveLog]);
+
+  // Countdown to next scheduled wave
+  useEffect(() => {
+    if (nextWaveIn === null || nextWaveIn <= 0) return;
+    const t = setTimeout(() => setNextWaveIn(v => Math.max(0, v - 1)), 1000);
+    return () => clearTimeout(t);
+  }, [nextWaveIn]);
 
   useEffect(() => {
     const fetch_ = () =>
@@ -610,6 +624,26 @@ export default function App() {
         }
       }
 
+      // ── Auto-clear HOLD items whose threat has been resolved ─────────────────
+      // Check every 60 frames (~1s) — avoids calling setPending every frame
+      if (tickRef.current % 60 === 0) {
+        const resolvedIds = new Set(
+          threatsRef.current.filter(t => t.intercepted || t.hit).map(t => t.id)
+        );
+        if (resolvedIds.size > 0) {
+          setPending(prev => {
+            const stale = prev.filter(p => resolvedIds.has(p.threat?.id));
+            if (stale.length === 0) return prev;
+            stale.forEach(p => {
+              fetch(`${API}/reject/${p.decision_id}`, { method: "POST" }).catch(() => {});
+            });
+            const updated = prev.filter(p => !resolvedIds.has(p.threat?.id));
+            pendingThreatIds.current = new Set(updated.map(x => x.threat?.id).filter(Boolean));
+            return updated;
+          });
+        }
+      }
+
       setIntercepts(prev => prev.map(i => ({ ...i, age: i.age + 1 })).filter(i => i.age < 160));
 
       // Move interceptors with homing guidance — steer toward threat's current position each frame
@@ -755,92 +789,104 @@ export default function App() {
 
   const injectThreat = () => { const th = randomThreat(); setThreats(p => [...p.slice(-15), th]); /* radar handles callDecide */ };
 
-  const injectScenario = () => {
-    // Variable wave size 2–7
+  // Build one wave — varies strategy each call
+  const buildWave = (waveIndex, existingWaveCount, currentShipStatus) => {
     const waveSize = 2 + Math.floor(Math.random() * 6);
-
-    // Attack strategy — varies each wave based on prior pattern
     const strategy = Math.random();
     let targetPool;
     if (strategy < 0.30) {
-      // Saturation: all threats on one city (pressure one defense node)
       const primary = TARGETS.north[Math.floor(Math.random() * TARGETS.north.length)];
       targetPool = Array(waveSize).fill(primary);
     } else if (strategy < 0.60) {
-      // Focused: ~70% on one city, rest on another
       const primary   = TARGETS.north[Math.floor(Math.random() * TARGETS.north.length)];
       const secondary = TARGETS.north.filter(t => t.id !== primary.id)[Math.floor(Math.random() * 2)];
-      targetPool = Array.from({ length: waveSize }, (_, i) =>
-        Math.random() < 0.70 ? primary : secondary
-      );
+      targetPool = Array.from({ length: waveSize }, () => Math.random() < 0.70 ? primary : secondary);
     } else {
-      // Dispersal: random mix across all north cities
       targetPool = Array.from({ length: waveSize }, () =>
         TARGETS.north[Math.floor(Math.random() * TARGETS.north.length)]
       );
     }
-
-    // Threat type composition — weight by wave number (escalation)
     const MISSILE_TYPES  = ["Ballistic missile", "Cruise missile"];
     const AIRCRAFT_TYPES = ["Strike aircraft", "Fighter jet"];
-    const ALL_TYPES      = [...MISSILE_TYPES, ...AIRCRAFT_TYPES, "Armed drone"];
+    // Escalate: wave 1 probes with mixed types, wave 2+ uses heavier assets
+    const typePool = waveIndex === 0
+      ? [...MISSILE_TYPES, ...AIRCRAFT_TYPES, "Armed drone"]
+      : waveIndex === 1
+        ? [...MISSILE_TYPES, ...MISSILE_TYPES, ...AIRCRAFT_TYPES]   // more missiles wave 2
+        : [...MISSILE_TYPES, ...MISSILE_TYPES, ...MISSILE_TYPES, ...AIRCRAFT_TYPES]; // saturate wave 3
     const waveTypes = Array.from({ length: waveSize }, () =>
-      ALL_TYPES[Math.floor(Math.random() * ALL_TYPES.length)]
+      typePool[Math.floor(Math.random() * typePool.length)]
     );
-
-    // Occasionally retarget some threats toward ships (naval interdiction)
-    // ~20% chance per threat after wave 2, ships add a layer of tactical complexity
-    const activeShips = shipStatus.filter(s => s.sam_count > 0);
+    const activeShips = currentShipStatus.filter(s => s.sam_count > 0);
     const finalTargets = targetPool.map(t => {
-      if (activeShips.length > 0 && waveLog.length >= 1 && Math.random() < 0.20) {
+      if (activeShips.length > 0 && existingWaveCount >= 1 && Math.random() < 0.20) {
         const ship = activeShips[Math.floor(Math.random() * activeShips.length)];
-        // Return a ship-as-target object compatible with spawnTowardTarget
         return { id: ship.id, name: ship.name, x: ship.x, y: ship.y, x_km: ship.x_km, y_km: ship.y_km };
       }
       return t;
     });
-
-    // Spawn positions spread across full south border
     const wave = finalTargets.map((target, i) => {
       const spawnX = 30 + Math.random() * 940;
       const spawnY = 660 + Math.random() * 60;
       return spawnTowardTarget(spawnX, spawnY, target, waveTypes[i]);
     });
+    return { wave, waveTypes };
+  };
 
-    wave.forEach((th, i) => {
-      setTimeout(() => { setThreats(p => [...p.slice(-20), th]); }, i * 500);
-    });
+  const injectScenario = () => {
+    if (campaignActive) return;
 
-    // Activate war mode on first wave
+    // Activate war mode on first campaign
     if (!warModeRef.current) {
       warModeRef.current = true;
       setWarMode(true);
-      setTimeout(() => {
-        setCivilians(prev => prev.slice(0, 1));
-      }, 3000);
+      setTimeout(() => setCivilians(prev => prev.slice(0, 1)), 3000);
     }
 
-    const newEntry = {
-      time: Date.now(),
-      count: wave.length,
-      targets: wave.map(t => t.target_name),
-      types:   waveTypes,
-      outcomes: [],  // filled in after intercept results
-    };
-    setWaveLog(w => {
-      const updated = [...w, newEntry];
+    // Pre-generate all 3 waves (escalating)
+    const snap = shipStatusRef.current;
+    const waves = [
+      buildWave(0, waveLog.length, snap),
+      buildWave(1, waveLog.length + 1, snap),
+      buildWave(2, waveLog.length + 2, snap),
+    ];
+    // Spacing: wave 1 now, wave 2 in ~28s, wave 3 in ~56s
+    const WAVE_GAP_MS = 28000;
+
+    setCampaignActive(true);
+    setCampaignWaveNum(1);
+    setNextWaveIn(Math.round(WAVE_GAP_MS / 1000));
+
+    waves.forEach(({ wave, waveTypes }, waveIdx) => {
       setTimeout(() => {
-        fetch(`${API}/forecast`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ wave_log: updated.map(x => ({...x, now: Date.now()})), base_count: 3 }),
-        }).then(r => r.json()).then(setForecast).catch(() => {});
-      }, 800);
-      return updated;
+        // Stagger threat spawns within the wave (500ms apart)
+        wave.forEach((th, i) => setTimeout(() => setThreats(p => [...p.slice(-20), th]), i * 500));
+
+        setWaveLog(prev => {
+          const entry = {
+            time: Date.now(), count: wave.length,
+            targets: wave.map(t => t.target_name),
+            types: waveTypes, outcomes: [],
+          };
+          return [...prev, entry];
+          // forecast useEffect fires automatically on waveLog change
+        });
+
+        setCampaignWaveNum(waveIdx + 1);
+
+        setTimeline(tl => [{
+          id: `wave-${Date.now()}`, type: "wave", time: Date.now(),
+          label: `Wave ${waveIdx + 1}/3: ${wave.length} threats — ${[...new Set(wave.map(t => t.target_name))].join(", ")}`,
+        }, ...tl.slice(0, 99)]);
+
+        if (waveIdx < 2) {
+          setNextWaveIn(Math.round(WAVE_GAP_MS / 1000));
+        } else {
+          setNextWaveIn(null);
+          setTimeout(() => setCampaignActive(false), 3000);
+        }
+      }, waveIdx * WAVE_GAP_MS);
     });
-    setTimeline(t => [{
-      id: `wave-${Date.now()}`, type: "wave", time: Date.now(),
-      label: `Wave ${waveLog.length + 1}: ${wave.length} threats — ${[...new Set(wave.map(t => t.target_name))].join(", ")}`,
-    }, ...t.slice(0, 99)]);
   };
 
   const northStatus = aircraftStatus.filter(b => BASES.north.find(nb => nb.id === b.id));
@@ -899,10 +945,27 @@ export default function App() {
             style={{ background: "#1a1400", border: "1px solid #facc1566", color: "#a08800", padding: "5px 12px", fontSize: 9, letterSpacing: 1, cursor: "pointer", borderRadius: 3 }}>
             ◇ SPY RECON
           </button>
-          <button onClick={injectScenario}
-            style={{ background: "#2a2000", border: "2px solid #facc15", color: "#facc15", padding: "5px 18px", fontSize: 10, letterSpacing: 2, cursor: "pointer", borderRadius: 3, fontWeight: "bold" }}>
-            ⚡ LAUNCH WAVE
+          <button onClick={injectScenario} disabled={campaignActive}
+            style={{ background: campaignActive ? "#1a1400" : "#2a2000", border: `2px solid ${campaignActive ? "#664d00" : "#facc15"}`, color: campaignActive ? "#664d00" : "#facc15", padding: "5px 18px", fontSize: 10, letterSpacing: 2, cursor: campaignActive ? "not-allowed" : "pointer", borderRadius: 3, fontWeight: "bold" }}>
+            ⚡ LAUNCH CAMPAIGN
           </button>
+          {campaignActive && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{ display: "flex", gap: 3 }}>
+                {[1,2,3].map(n => (
+                  <div key={n} style={{ width: 8, height: 8, borderRadius: "50%", background: n < campaignWaveNum ? "#4ade80" : n === campaignWaveNum ? "#f87171" : "#1a3a56", border: "1px solid #2a5570", boxShadow: n === campaignWaveNum ? "0 0 6px #f8717166" : "none" }} />
+                ))}
+              </div>
+              <span style={{ fontSize: 9, color: "#f87171", letterSpacing: 1 }}>
+                {campaignWaveNum < 3 ? `WAVE ${campaignWaveNum}/3 ACTIVE` : "WAVE 3/3 FINAL"}
+              </span>
+              {nextWaveIn !== null && nextWaveIn > 0 && (
+                <span style={{ fontSize: 9, color: "#facc15", letterSpacing: 1, background: "#1a1000", border: "1px solid #facc1544", padding: "1px 6px", borderRadius: 2 }}>
+                  NEXT IN {nextWaveIn}s
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1286,7 +1349,7 @@ export default function App() {
                   {!th.intercepted && (
                     <>
                       <text y="-13" fill={isHl ? "#ff6060" : "#f87171"} fontSize="7.5" textAnchor="middle" fontWeight="bold">{th.id}</text>
-                      <text y="21" fill="rgba(248,113,113,0.55)" fontSize="6.5" textAnchor="middle">→ {th.target_name} · {formatETA(Math.max(0, th.eta - Math.floor(th.age / 60)))}</text>
+                      <text y="21" fill="rgba(248,113,113,0.55)" fontSize="6.5" textAnchor="middle">→ {th.target_name} · {formatETA(Math.max(0, (th.anim_eta_s || 30) - Math.floor(th.age / 60)))}</text>
                     </>
                   )}
                   {th.intercepted && dwnAge < 20 && (
@@ -1391,23 +1454,31 @@ export default function App() {
 
               {/* AI wave forecast intel card */}
               {forecast && waveLog.length > 0 && (
-                <div style={{ background: "#0e1a0a", border: "1px solid #1e3a14", borderLeft: "3px solid #4ade80", borderRadius: 4, padding: "8px 10px" }}>
+                <div style={{ background: "#0e1a0a", border: `1px solid ${campaignActive && campaignWaveNum < 3 ? "#facc1555" : "#1e3a14"}`, borderLeft: `3px solid ${campaignActive && campaignWaveNum < 3 ? "#facc15" : "#4ade80"}`, borderRadius: 4, padding: "8px 10px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ fontSize: 9, color: "#4ade80" }}>◈</span>
-                      <span style={{ fontSize: 7.5, color: "#4ade80", letterSpacing: 2, fontWeight: "bold" }}>AI WAVE FORECAST</span>
+                      <span style={{ fontSize: 9, color: campaignActive && campaignWaveNum < 3 ? "#facc15" : "#4ade80" }}>◈</span>
+                      <span style={{ fontSize: 7.5, color: campaignActive && campaignWaveNum < 3 ? "#facc15" : "#4ade80", letterSpacing: 2, fontWeight: "bold" }}>
+                        {campaignActive && campaignWaveNum < 3
+                          ? `AI PREDICTS: WAVE ${campaignWaveNum + 1}/3`
+                          : "AI WAVE FORECAST"}
+                      </span>
                     </div>
                     <span style={{ fontSize: 7, padding: "1px 6px", background: riskColor(forecast.risk_level)+"22", color: riskColor(forecast.risk_level), border: `1px solid ${riskColor(forecast.risk_level)}44`, borderRadius: 2, letterSpacing: 1 }}>
                       {(forecast.risk_level||"unknown").toUpperCase()}
                     </span>
                   </div>
 
-                  {/* Next wave ETA — hero number */}
+                  {/* Next wave ETA — hero number; during campaign show actual countdown */}
                   <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
                     <div>
-                      <div style={{ fontSize: 7, color: "#2a5a2a", letterSpacing: 1, marginBottom: 1 }}>NEXT WAVE IN ~</div>
-                      <div style={{ fontSize: 26, fontWeight: "bold", color: forecast.next_wave_estimate_min != null ? "#4ade80" : "#2a5a2a", lineHeight: 1 }}>
-                        {forecast.next_wave_estimate_min != null ? `${forecast.next_wave_estimate_min}m` : "—"}
+                      <div style={{ fontSize: 7, color: "#2a5a2a", letterSpacing: 1, marginBottom: 1 }}>
+                        {campaignActive && nextWaveIn !== null ? "INBOUND IN" : "NEXT WAVE IN ~"}
+                      </div>
+                      <div style={{ fontSize: 26, fontWeight: "bold", color: campaignActive && nextWaveIn !== null ? "#facc15" : forecast.next_wave_estimate_min != null ? "#4ade80" : "#2a5a2a", lineHeight: 1 }}>
+                        {campaignActive && nextWaveIn !== null
+                          ? `${nextWaveIn}s`
+                          : forecast.next_wave_estimate_min != null ? `${forecast.next_wave_estimate_min}m` : "—"}
                       </div>
                     </div>
                     <div style={{ flex: 1 }}>
@@ -1459,9 +1530,9 @@ export default function App() {
               }).map(p => {
                 const d = p.decision;
                 const elapsed   = Math.floor((Date.now() / 1000) - p.created_at);
-                const totalEta  = p.threat.eta || 600;
+                const totalEta  = p.threat.anim_eta_s || 30;  // animation-scale seconds, not real-world
                 const remaining = Math.max(0, totalEta - elapsed);
-                const etaColor  = remaining < 120 ? "#f87171" : remaining < 300 ? "#facc15" : "#4ade80";
+                const etaColor  = remaining < 8 ? "#f87171" : remaining < 15 ? "#facc15" : "#4ade80";
                 const isCapital = p.threat?.target_name === "Arktholm";
                 return (
                   <div key={p.decision_id}
@@ -1494,8 +1565,8 @@ export default function App() {
                       <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 8 }}>
                         <div style={{ fontSize: 7, color: "#7a6a30", letterSpacing: 1, marginBottom: 1 }}>IMPACT IN</div>
                         <div style={{ fontSize: 24, fontWeight: "bold", color: etaColor, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>{formatETA(remaining)}</div>
-                        <div style={{ fontSize: 7, color: remaining < 60 ? "#f87171" : "#7a6a30", marginTop: 2, fontWeight: remaining < 60 ? "bold" : "normal" }}>
-                          {remaining < 60 ? "⚠ CRITICAL — DECIDE NOW" : "AWAITING DECISION"}
+                        <div style={{ fontSize: 7, color: remaining < 8 ? "#f87171" : "#7a6a30", marginTop: 2, fontWeight: remaining < 8 ? "bold" : "normal" }}>
+                          {remaining < 8 ? "⚠ CRITICAL — DECIDE NOW" : remaining === 0 ? "EXPIRED" : "AWAITING DECISION"}
                         </div>
                       </div>
                     </div>
