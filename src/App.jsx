@@ -114,11 +114,18 @@ export default function App() {
   const [showRanges,       setShowRanges]       = useState(false);
   const [aircraftStatus,   setAircraftStatus]   = useState([]);
   const [threatenedTargets,setThreatenedTargets]= useState(new Set());
-  const [overrideBase,     setOverrideBase]     = useState({});
-  const [waveLog,          setWaveLog]          = useState([]);
-  const [forecast,         setForecast]         = useState(null);
+  const [overrideBase,       setOverrideBase]       = useState({});
+  const [waveLog,            setWaveLog]            = useState([]);
+  const [forecast,           setForecast]           = useState(null);
+  const [hoveredId,          setHoveredId]          = useState(null);
+  const [expandedReasoning,  setExpandedReasoning]  = useState(new Set());
+  const [sessionCost,        setSessionCost]        = useState(0);
   const frameRef = useRef(null);
   const tickRef  = useRef(0);
+
+  const toggleReasoning = id => setExpandedReasoning(s => {
+    const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n;
+  });
 
   useEffect(() => {
     fetch(`${API}/`).then(r => setApiStatus(r.ok ? "online" : "offline")).catch(() => setApiStatus("offline"));
@@ -130,6 +137,14 @@ export default function App() {
         .then(d => { if (d.bases) setAircraftStatus(d.bases); }).catch(() => {});
     fetch_();
     const iv = setInterval(fetch_, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    const fetch_ = () =>
+      fetch(`${API}/state/summary`).then(r => r.json())
+        .then(d => { if (d.session_costs) setSessionCost(d.session_costs.total_usd || 0); }).catch(() => {});
+    const iv = setInterval(fetch_, 8000);
     return () => clearInterval(iv);
   }, []);
 
@@ -282,7 +297,18 @@ export default function App() {
 
   const northStatus = aircraftStatus.filter(b => BASES.north.find(nb => nb.id === b.id));
   const coverageGaps = northStatus.filter(b => b.available.length === 0).map(b => b.id);
-  const RANGE_SVG = 700 * SCALE_X; // fighter range in SVG pixels (~420px)
+  const RANGE_SVG = 700 * SCALE_X;
+
+  // Highlight state — derived from whichever card is hovered
+  const hl = (() => {
+    if (!hoveredId) return null;
+    const d = decisions.find(x => x.decision_id === hoveredId);
+    if (d) return { baseId: d.recommended_base, threatId: d.threat_id };
+    const p = pending.find(x => x.decision_id === hoveredId);
+    if (p) return { baseId: p.decision?.recommended_base, threatId: p.threat?.id };
+    return null;
+  })();
+  const dim = hl !== null;
 
   return (
     <div style={{ fontFamily: "'Courier New', monospace", background: "#040b12", color: "#b8cfd8", minHeight: "100vh", display: "flex", flexDirection: "column", fontSize: 13 }}>
@@ -377,25 +403,36 @@ export default function App() {
             ))}
 
             {/* Threat trajectory lines */}
-            {threats.map(th => (
-              <line key={`traj-${th.id}`} x1={th.x} y1={th.y} x2={th.target_x} y2={th.target_y}
-                stroke="rgba(248,113,113,0.14)" strokeWidth="1" strokeDasharray="5 7" />
-            ))}
+            {threats.map(th => {
+              const isHl = hl?.threatId === th.id;
+              return (
+                <line key={`traj-${th.id}`} x1={th.x} y1={th.y} x2={th.target_x} y2={th.target_y}
+                  stroke={isHl ? "#f87171" : "rgba(248,113,113,0.14)"}
+                  strokeWidth={isHl ? 1.5 : 1} strokeDasharray="5 7"
+                  opacity={dim && !isHl ? 0.06 : 1} />
+              );
+            })}
 
             {/* Intercept lines */}
-            {intercepts.map(i => (
-              <line key={i.id} x1={i.x1} y1={i.y1} x2={i.x2} y2={i.y2}
-                stroke="#facc15" strokeWidth="1" strokeDasharray="5 3"
-                opacity={Math.max(0, 1 - i.age / 160)} />
-            ))}
+            {intercepts.map(i => {
+              const isHl = i.id === hoveredId;
+              const baseOpacity = Math.max(0, 1 - i.age / 160);
+              return (
+                <line key={i.id} x1={i.x1} y1={i.y1} x2={i.x2} y2={i.y2}
+                  stroke={isHl ? "#facc15" : "#facc15"} strokeWidth={isHl ? 2 : 1}
+                  strokeDasharray="5 3"
+                  opacity={dim ? (isHl ? Math.min(1, baseOpacity * 3) : 0.05) : baseOpacity} />
+              );
+            })}
 
             {/* North protection targets */}
             {TARGETS.north.map(t => {
               const sz = t.type === "capital" ? 18 : 13;
               const cx = t.x, cy = t.y;
               const threatened = threatenedTargets.has(t.id);
+              const targetDim = dim ? 0.25 : 1;
               return (
-                <g key={t.id}>
+                <g key={t.id} opacity={targetDim} style={{ transition: "opacity 0.25s" }}>
                   {threatened && <circle cx={cx} cy={cy} r={sz * 1.9} fill="none" stroke="#f87171" strokeWidth="1" strokeDasharray="3 3" opacity="0.65" />}
                   <rect x={cx - sz/2} y={cy - sz/2} width={sz} height={sz}
                     fill={t.type === "capital" ? "#ffcc00" : "#dde"}
@@ -429,9 +466,16 @@ export default function App() {
               const avail = st ? st.available.length : null;
               const depleted = avail === 0;
               const col = depleted ? "#f87171" : "#3fc1ff";
+              const isHl = hl?.baseId === b.id;
               return (
-                <g key={b.id}>
-                  <circle cx={b.x} cy={b.y} r="26" fill="none" stroke={col} strokeWidth="0.5" strokeDasharray="4 3" opacity="0.35" />
+                <g key={b.id} opacity={dim && !isHl ? 0.1 : 1} style={{ transition: "opacity 0.25s" }}>
+                  {isHl && (
+                    <circle cx={b.x} cy={b.y} r="32" fill="none" stroke="#3fc1ff" strokeWidth="1.5" opacity="0.5">
+                      <animate attributeName="r" values="28;40;28" dur="1.4s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" values="0.5;0.1;0.5" dur="1.4s" repeatCount="indefinite" />
+                    </circle>
+                  )}
+                  <circle cx={b.x} cy={b.y} r="26" fill="none" stroke={col} strokeWidth={isHl ? 1.2 : 0.5} strokeDasharray="4 3" opacity={isHl ? 0.7 : 0.35} />
                   <polygon points={`${b.x},${b.y-11} ${b.x-9},${b.y+6} ${b.x+9},${b.y+6}`} fill={col} stroke="#000" strokeWidth="1" />
                   <text x={b.x} y={b.y+22} fill={col} fontSize="7" textAnchor="middle" opacity="0.85">{b.name}</text>
                   {avail !== null && (
@@ -443,7 +487,7 @@ export default function App() {
 
             {/* South bases (enemy — dim) */}
             {BASES.south.map(b => (
-              <g key={b.id} opacity="0.55">
+              <g key={b.id} opacity={dim ? 0.06 : 0.55} style={{ transition: "opacity 0.25s" }}>
                 <circle cx={b.x} cy={b.y} r="22" fill="none" stroke="#ff8855" strokeWidth="0.5" strokeDasharray="4 3" opacity="0.3" />
                 <polygon points={`${b.x},${b.y-11} ${b.x-9},${b.y+6} ${b.x+9},${b.y+6}`} fill="#ff8855" stroke="#000" strokeWidth="1" />
                 <text x={b.x} y={b.y+22} fill="#ff8855" fontSize="7" textAnchor="middle" opacity="0.7">{b.name}</text>
@@ -452,7 +496,7 @@ export default function App() {
 
             {/* Civilians */}
             {civilians.map(c => (
-              <g key={c.id} transform={`translate(${c.x},${c.y})`}>
+              <g key={c.id} transform={`translate(${c.x},${c.y})`} opacity={dim ? 0.07 : 1} style={{ transition: "opacity 0.25s" }}>
                 <circle r="5" fill="none" stroke="rgba(255,255,255,0.45)" strokeWidth="1" />
                 <circle r="2" fill="rgba(255,255,255,0.55)" />
                 <text y="14" fill="rgba(255,255,255,0.28)" fontSize="7" textAnchor="middle">{c.id}</text>
@@ -460,15 +504,25 @@ export default function App() {
             ))}
 
             {/* Threats */}
-            {threats.map(th => (
-              <g key={th.id} transform={`translate(${th.x},${th.y})`}>
-                <circle r="14" fill="url(#threatGlow)" opacity={0.5 + 0.5 * Math.sin(th.age * 0.15)} />
-                <polygon points="0,-8 -7,5 7,5" fill="#f87171" stroke="#000" strokeWidth="0.8"
-                  transform={`rotate(${Math.atan2(th.vy, th.vx) * 180 / Math.PI + 90})`} />
-                <text y="-13" fill="#f87171" fontSize="7.5" textAnchor="middle" fontWeight="bold">{th.id}</text>
-                <text y="21" fill="rgba(248,113,113,0.55)" fontSize="6.5" textAnchor="middle">→ {th.target_name} · {formatETA(Math.max(0, th.eta - Math.floor(th.age / 60)))}</text>
-              </g>
-            ))}
+            {threats.map(th => {
+              const isHl = hl?.threatId === th.id;
+              return (
+                <g key={th.id} transform={`translate(${th.x},${th.y})`}
+                  opacity={dim && !isHl ? 0.1 : 1} style={{ transition: "opacity 0.25s" }}>
+                  {isHl && (
+                    <circle r="22" fill="none" stroke="#f87171" strokeWidth="1" opacity="0.4">
+                      <animate attributeName="r" values="16;28;16" dur="1.2s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" values="0.5;0.1;0.5" dur="1.2s" repeatCount="indefinite" />
+                    </circle>
+                  )}
+                  <circle r={isHl ? 18 : 14} fill="url(#threatGlow)" opacity={0.5 + 0.5 * Math.sin(th.age * 0.15)} />
+                  <polygon points="0,-8 -7,5 7,5" fill="#f87171" stroke="#000" strokeWidth="0.8"
+                    transform={`rotate(${Math.atan2(th.vy, th.vx) * 180 / Math.PI + 90})`} />
+                  <text y="-13" fill={isHl ? "#ff6060" : "#f87171"} fontSize="7.5" textAnchor="middle" fontWeight="bold">{th.id}</text>
+                  <text y="21" fill="rgba(248,113,113,0.55)" fontSize="6.5" textAnchor="middle">→ {th.target_name} · {formatETA(Math.max(0, th.eta - Math.floor(th.age / 60)))}</text>
+                </g>
+              );
+            })}
 
             {/* Scale bar */}
             <line x1="840" y1="752" x2="960" y2="752" stroke="white" strokeWidth="1.5" opacity="0.18" />
@@ -524,56 +578,78 @@ export default function App() {
                   NO ACTIVE THREATS
                 </div>
               )}
-              {decisions.map((d, i) => (
-                <div key={d.decision_id} onClick={() => setSelected(selected === d.decision_id ? null : d.decision_id)}
-                  style={{ padding: "10px 14px", borderBottom: "1px solid #080e16", cursor: "pointer", background: selected === d.decision_id ? "#0a1e2c" : i === 0 ? "rgba(248,113,113,0.04)" : "transparent" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                      <span style={{ fontSize: 9, color: "#f87171", letterSpacing: 1 }}>{d.threat_id}</span>
-                      <span style={{ fontSize: 8, padding: "1px 5px", background: prioColor(d.priority) + "22", color: prioColor(d.priority), border: `1px solid ${prioColor(d.priority)}44` }}>
-                        {(d.priority || "urgent").toUpperCase()}
+              {decisions.map((d, i) => {
+                const isSelected = selected === d.decision_id;
+                const isHovered  = hoveredId === d.decision_id;
+                return (
+                  <div key={d.decision_id}
+                    onClick={() => setSelected(isSelected ? null : d.decision_id)}
+                    onMouseEnter={() => setHoveredId(d.decision_id)}
+                    onMouseLeave={() => setHoveredId(null)}
+                    style={{ padding: "10px 14px", borderBottom: "1px solid #080e16", cursor: "pointer",
+                      background: isSelected ? "#0b2030" : isHovered ? "#071520" : i === 0 ? "rgba(248,113,113,0.03)" : "transparent",
+                      borderLeft: isHovered ? "2px solid #3fc1ff" : "2px solid transparent",
+                      transition: "background 0.15s, border-left 0.15s" }}>
+
+                    {/* Row 1: threat ID + priority + time */}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+                      <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                        <span style={{ fontSize: 9, color: "#f87171", letterSpacing: 1, fontWeight: "bold" }}>{d.threat_id}</span>
+                        <span style={{ fontSize: 7, padding: "1px 5px", background: prioColor(d.priority) + "22", color: prioColor(d.priority), border: `1px solid ${prioColor(d.priority)}44`, letterSpacing: 1 }}>
+                          {(d.priority || "urgent").toUpperCase()}
+                        </span>
+                        {d.status === "approved" && <span style={{ fontSize: 7, color: "#4ade80", opacity: 0.6 }}>✓ APPROVED</span>}
+                        {d.status === "auto_executed" && <span style={{ fontSize: 7, color: "#3fc1ff", opacity: 0.5 }}>AUTO</span>}
+                      </div>
+                      <span style={{ fontSize: 8, color: "#1e3a4a" }}>{new Date(d.timestamp * 1000).toLocaleTimeString("en-GB")}</span>
+                    </div>
+
+                    {/* Row 2: threat type → base */}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+                      <span style={{ fontSize: 10, color: "#7a9aaa" }}>{d.threat_type}</span>
+                      <span style={{ fontSize: 10, color: "#3fc1ff", fontWeight: "bold" }}>{d.recommended_base_name?.split(" ")[0]}</span>
+                    </div>
+
+                    {/* Row 3: weapon + confidence */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 8, color: "#2a5a6a", flexShrink: 0 }}>
+                        {(d.recommended_weapon || "").replace(/_/g, " ")} · {d.recommended_asset_type}
                       </span>
+                      <div style={{ flex: 1, height: 2, background: "#0a1820", borderRadius: 2 }}>
+                        <div style={{ width: `${d.confidence}%`, height: "100%", background: confColor(d.confidence), borderRadius: 2 }} />
+                      </div>
+                      <span style={{ fontSize: 9, color: confColor(d.confidence), minWidth: 26 }}>{d.confidence}%</span>
                     </div>
-                    <span style={{ fontSize: 8, color: "#1e3a4a" }}>{new Date(d.timestamp * 1000).toLocaleTimeString("en-GB")}</span>
+
+                    {/* Expanded detail */}
+                    {isSelected && (
+                      <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #0d1e2a" }}>
+                        {d.estimated_cost_usd && (
+                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, padding: "4px 8px", background: "#05101a", border: "1px solid #0d2030" }}>
+                            <span style={{ fontSize: 8, color: "#2a5a6a", letterSpacing: 1 }}>MISSION COST</span>
+                            <span style={{ fontSize: 10, color: "#facc15", fontWeight: "bold" }}>${d.estimated_cost_usd.toLocaleString()}</span>
+                          </div>
+                        )}
+                        {d.cost_rationale && <Section label="COST RATIONALE" color="#8a7040">{d.cost_rationale}</Section>}
+                        <Section label="REASONING" color="#8ab0c0">{d.reasoning}</Section>
+                        {d.alternatives_rejected?.length > 0 && (
+                          <div style={{ marginBottom: 8 }}>
+                            <Label>ALTERNATIVES REJECTED</Label>
+                            {d.alternatives_rejected.map((alt, j) => (
+                              <div key={j} style={{ fontSize: 9, color: "#4a6a7a", marginBottom: 3, paddingLeft: 8, borderLeft: "2px solid #0d2030" }}>
+                                <span style={{ color: "#6a8a9a" }}>{alt.base}</span> — {alt.reason}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {d.trade_offs && <Section label="TRADE-OFFS" color="#facc15">{d.trade_offs}</Section>}
+                        {d.civilian_note && <Section label={`CIVILIAN RISK: ${(d.civilian_risk||"").toUpperCase()}`} color="#facc15">{d.civilian_note}</Section>}
+                        <Section label="FUTURE RISK" color="#4ade80">{d.future_risk}</Section>
+                      </div>
+                    )}
                   </div>
-                  <div style={{ fontSize: 10, color: "#8ab0c0", marginBottom: 2 }}>{d.threat_type}</div>
-                  <div style={{ fontSize: 11, color: "#3fc1ff", fontWeight: "bold", marginBottom: 2 }}>{d.recommended_base_name}</div>
-                  <div style={{ fontSize: 10, color: "#4a7a8a", marginBottom: 6 }}>
-                    {(d.recommended_weapon || "").replace(/_/g, " ")} · {d.recommended_asset_type}
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ flex: 1, height: 2, background: "#0a1820", borderRadius: 2 }}>
-                      <div style={{ width: `${d.confidence}%`, height: "100%", background: confColor(d.confidence), borderRadius: 2 }} />
-                    </div>
-                    <span style={{ fontSize: 9, color: confColor(d.confidence), minWidth: 28 }}>{d.confidence}%</span>
-                  </div>
-
-                  {selected === d.decision_id && (
-                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #0d1e2a" }}>
-                      <Section label="REASONING" color="#8ab0c0">{d.reasoning}</Section>
-
-                      {d.alternatives_rejected?.length > 0 && (
-                        <div style={{ marginBottom: 8 }}>
-                          <Label>ALTERNATIVES REJECTED</Label>
-                          {d.alternatives_rejected.map((alt, j) => (
-                            <div key={j} style={{ fontSize: 9, color: "#4a6a7a", marginBottom: 3, paddingLeft: 8, borderLeft: "2px solid #0d2030" }}>
-                              <span style={{ color: "#6a8a9a" }}>{alt.base}</span> — {alt.reason}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {d.trade_offs && <Section label="TRADE-OFFS" color="#facc15">{d.trade_offs}</Section>}
-
-                      {d.civilian_note && (
-                        <Section label={`CIVILIAN RISK: ${(d.civilian_risk || "").toUpperCase()}`} color="#facc15">{d.civilian_note}</Section>
-                      )}
-
-                      <Section label="FUTURE RISK" color="#4ade80">{d.future_risk}</Section>
-                    </div>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
 
@@ -587,89 +663,131 @@ export default function App() {
               )}
               {pending.map(p => {
                 const d = p.decision;
-                const elapsed = Math.floor((Date.now() / 1000) - p.created_at);
-                const urgency = elapsed > 60 ? "#f87171" : elapsed > 30 ? "#facc15" : "#4ade80";
+                const elapsed  = Math.floor((Date.now() / 1000) - p.created_at);
+                const totalEta = p.threat.eta || 600;
+                const remaining = Math.max(0, totalEta - elapsed);
+                const etaColor  = remaining < 120 ? "#f87171" : remaining < 300 ? "#facc15" : "#4ade80";
+                const pct       = (remaining / totalEta) * 100;
+                const isHovered = hoveredId === p.decision_id;
                 return (
-                  <div key={p.decision_id} style={{ borderBottom: "1px solid #0d1e2a", padding: "12px 14px" }}>
-                    {/* Header */}
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
-                      <div>
-                        <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 3 }}>
-                          <span style={{ fontSize: 9, color: "#f87171", letterSpacing: 1 }}>{p.threat.id}</span>
-                          <span style={{ fontSize: 8, padding: "1px 5px", background: "#2a1500", color: "#facc15", border: "1px solid #facc1544" }}>
-                            AWAITING APPROVAL
+                  <div key={p.decision_id}
+                    onMouseEnter={() => setHoveredId(p.decision_id)}
+                    onMouseLeave={() => setHoveredId(null)}
+                    style={{ borderBottom: "1px solid #0d1e2a", borderLeft: `3px solid ${etaColor}`,
+                      background: isHovered ? "#080f18" : "#050c14",
+                      transition: "background 0.15s" }}>
+
+                    {/* ── Zone 1: THREAT CONTEXT ─────────────────────── */}
+                    <div style={{ padding: "10px 14px 8px", borderBottom: "1px solid #0a1620" }}>
+                      {/* Primary row: threat ID | priority | ETA */}
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <span style={{ fontSize: 10, color: "#f87171", letterSpacing: 1, fontWeight: "bold" }}>{p.threat.id}</span>
+                          <span style={{ fontSize: 7, padding: "1px 6px", background: prioColor(d.priority) + "22", color: prioColor(d.priority), border: `1px solid ${prioColor(d.priority)}44`, letterSpacing: 1 }}>
+                            {(d.priority || "urgent").toUpperCase()}
                           </span>
                         </div>
-                        <div style={{ fontSize: 10, color: "#8ab0c0" }}>{p.threat.type} → <span style={{ color: "#facc15" }}>{p.threat.target_name}</span></div>
+                        {/* ETA — the primary prioritisation signal */}
+                        <div style={{ textAlign: "right" }}>
+                          <div style={{ fontSize: 7, color: "#2a5a6a", letterSpacing: 1, marginBottom: 1 }}>IMPACT IN</div>
+                          <div style={{ fontSize: 22, fontWeight: "bold", color: etaColor, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
+                            {formatETA(remaining)}
+                          </div>
+                        </div>
                       </div>
 
-                      {/* ETA countdown — primary prioritisation signal */}
-                      {(() => {
-                        const totalEta = p.threat.eta || 600;
-                        const remaining = Math.max(0, totalEta - elapsed);
-                        const etaColor = remaining < 120 ? "#f87171" : remaining < 300 ? "#facc15" : "#4ade80";
-                        const pct = (remaining / totalEta) * 100;
-                        return (
-                          <div style={{ textAlign: "center", minWidth: 72 }}>
-                            <div style={{ fontSize: 7, color: "#2a5a6a", letterSpacing: 1, marginBottom: 2 }}>
-                              → {p.threat.target_name}
-                            </div>
-                            <div style={{ fontSize: remaining < 120 ? 20 : 18, fontWeight: "bold", color: etaColor, lineHeight: 1, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
-                              {formatETA(remaining)}
-                            </div>
-                            <div style={{ fontSize: 7, color: "#1a3a4a", marginTop: 2, marginBottom: 3 }}>
-                              {p.threat.dist_km ? `${p.threat.dist_km} km` : ""} · {p.threat.speed} km/h
-                            </div>
-                            <div style={{ height: 3, background: "#0a1820", borderRadius: 2 }}>
-                              <div style={{ width: `${pct}%`, height: "100%", background: etaColor, borderRadius: 2, transition: "width 1s linear" }} />
-                            </div>
-                          </div>
-                        );
-                      })()}
+                      {/* ETA progress bar */}
+                      <div style={{ height: 2, background: "#0a1820", borderRadius: 2, marginBottom: 6 }}>
+                        <div style={{ width: `${pct}%`, height: "100%", background: etaColor, borderRadius: 2, transition: "width 1s linear" }} />
+                      </div>
+
+                      {/* Threat context: type · distance · speed → target */}
+                      <div style={{ fontSize: 9, color: "#7a9aaa" }}>
+                        <span style={{ color: "#a0c0cc" }}>{p.threat.type}</span>
+                        {p.threat.dist_km && <span style={{ color: "#3a6070" }}> · {p.threat.dist_km} km · {p.threat.speed} km/h</span>}
+                        <span style={{ color: "#3a6070" }}> → </span>
+                        <span style={{ color: "#facc15", fontWeight: "bold" }}>{p.threat.target_name}</span>
+                      </div>
                     </div>
 
-                    {/* AI recommendation */}
-                    <div style={{ fontSize: 11, color: "#3fc1ff", fontWeight: "bold", marginBottom: 2 }}>{d.recommended_base_name}</div>
-                    <div style={{ fontSize: 10, color: "#4a7a8a", marginBottom: 8 }}>
-                      {(d.recommended_weapon || "").replace(/_/g, " ")} · {d.recommended_asset_type} · {d.confidence}% conf
-                    </div>
-
-                    {/* Hold reasons */}
-                    <div style={{ marginBottom: 8 }}>
+                    {/* ── Zone 2: HOLD REASONS ───────────────────────── */}
+                    <div style={{ padding: "8px 14px", borderBottom: "1px solid #0a1620", background: "rgba(250,204,21,0.03)" }}>
+                      <div style={{ fontSize: 7, color: "#6a5a00", letterSpacing: 2, marginBottom: 5 }}>WHY HELD FOR REVIEW</div>
                       {p.approval_reasons.map((r, i) => (
-                        <div key={i} style={{ fontSize: 9, color: "#facc15", padding: "3px 8px", background: "#1a1200", border: "1px solid #facc1530", borderRadius: 2, marginBottom: 3 }}>
-                          ⚠ {r}
+                        <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 6, marginBottom: 4 }}>
+                          <span style={{ color: "#facc15", fontSize: 10, flexShrink: 0, marginTop: 1 }}>⚠</span>
+                          <span style={{ fontSize: 9, color: "#c0a030", lineHeight: 1.4 }}>{r}</span>
                         </div>
                       ))}
                     </div>
 
-                    {/* Reasoning */}
-                    <div style={{ fontSize: 9, color: "#5a8a9a", lineHeight: 1.5, marginBottom: 10 }}>{d.reasoning}</div>
+                    {/* ── Zone 3: AI RECOMMENDATION ─────────────────── */}
+                    <div style={{ padding: "8px 14px", borderBottom: "1px solid #0a1620" }}>
+                      <div style={{ fontSize: 7, color: "#1e4a5a", letterSpacing: 2, marginBottom: 6 }}>AI RECOMMENDS</div>
 
-                    {/* Base override */}
-                    <div style={{ marginBottom: 8 }}>
-                      <div style={{ fontSize: 8, color: "#2a5a6a", letterSpacing: 1, marginBottom: 4 }}>OVERRIDE BASE</div>
-                      <select
-                        value={overrideBase[p.decision_id] || ""}
-                        onChange={e => setOverrideBase(o => ({ ...o, [p.decision_id]: e.target.value || undefined }))}
-                        style={{ width: "100%", background: "#05101a", border: "1px solid #0d2030", color: overrideBase[p.decision_id] ? "#3fc1ff" : "#3a5a6a", padding: "4px 8px", fontSize: 9, cursor: "pointer" }}>
-                        <option value="">Use AI recommendation ({d.recommended_base})</option>
-                        {BASES.north.map(b => (
-                          <option key={b.id} value={b.id}>{b.id} — {b.name}</option>
-                        ))}
-                      </select>
+                      {/* Base name — the most important decision output */}
+                      <div style={{ fontSize: 13, color: "#3fc1ff", fontWeight: "bold", marginBottom: 3 }}>{d.recommended_base_name}</div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <span style={{ fontSize: 9, color: "#4a8a9a" }}>
+                          {(d.recommended_weapon || "").replace(/_/g, " ")} · {d.recommended_asset_type}
+                        </span>
+                        <span style={{ fontSize: 9, color: confColor(d.confidence), fontWeight: "bold" }}>{d.confidence}%</span>
+                      </div>
+
+                      {/* Confidence bar */}
+                      <div style={{ height: 3, background: "#0a1820", borderRadius: 2, marginBottom: 8 }}>
+                        <div style={{ width: `${d.confidence}%`, height: "100%", background: confColor(d.confidence), borderRadius: 2 }} />
+                      </div>
+
+                      {/* Collapsible reasoning */}
+                      <button onClick={() => toggleReasoning(p.decision_id)}
+                        style={{ background: "none", border: "none", color: "#2a5a6a", fontSize: 8, cursor: "pointer", padding: 0, letterSpacing: 1, fontFamily: "inherit" }}>
+                        {expandedReasoning.has(p.decision_id) ? "▲ HIDE REASONING" : "▼ SHOW REASONING"}
+                      </button>
+                      {expandedReasoning.has(p.decision_id) && (
+                        <div style={{ marginTop: 6, fontSize: 9, color: "#5a8a9a", lineHeight: 1.6, paddingLeft: 8, borderLeft: "2px solid #0d2030" }}>
+                          <div style={{ marginBottom: 4 }}>{d.reasoning}</div>
+                          {d.trade_offs && <div style={{ color: "#8a7030" }}>{d.trade_offs}</div>}
+                          {d.alternatives_rejected?.length > 0 && (
+                            <div style={{ marginTop: 4 }}>
+                              {d.alternatives_rejected.map((alt, j) => (
+                                <div key={j} style={{ color: "#3a5a6a", marginTop: 2 }}>
+                                  <span style={{ color: "#5a7a8a" }}>{alt.base}</span>: {alt.reason}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
 
-                    {/* Actions */}
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <button onClick={() => handleApprove(p.decision_id)}
-                        style={{ flex: 1, padding: "7px 0", background: "#0a2a1a", border: "1px solid #4ade80", color: "#4ade80", fontSize: 9, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit" }}>
-                        ✓ APPROVE
-                      </button>
-                      <button onClick={() => handleReject(p.decision_id)}
-                        style={{ flex: 1, padding: "7px 0", background: "#1a0808", border: "1px solid #f87171", color: "#f87171", fontSize: 9, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit" }}>
-                        ✕ REJECT
-                      </button>
+                    {/* ── Zone 4: CONTROLS ───────────────────────────── */}
+                    <div style={{ padding: "8px 14px" }}>
+                      {/* Override selector */}
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 7, color: "#1e4a5a", letterSpacing: 2, marginBottom: 4 }}>OVERRIDE BASE (OPTIONAL)</div>
+                        <select
+                          value={overrideBase[p.decision_id] || ""}
+                          onChange={e => setOverrideBase(o => ({ ...o, [p.decision_id]: e.target.value || undefined }))}
+                          style={{ width: "100%", background: "#05101a", border: "1px solid #0d2030", color: overrideBase[p.decision_id] ? "#3fc1ff" : "#2a4a5a", padding: "5px 8px", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>
+                          <option value="">AI choice: {d.recommended_base}</option>
+                          {BASES.north.map(b => (
+                            <option key={b.id} value={b.id}>{b.id} — {b.name}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Primary CTAs — large hit targets, clear affordance */}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => handleApprove(p.decision_id)}
+                          style={{ flex: 2, padding: "9px 0", background: "#071f0f", border: "1px solid #4ade80", color: "#4ade80", fontSize: 9, letterSpacing: 2, cursor: "pointer", fontFamily: "inherit", fontWeight: "bold" }}>
+                          ✓ APPROVE & DEPLOY
+                        </button>
+                        <button onClick={() => handleReject(p.decision_id)}
+                          style={{ flex: 1, padding: "9px 0", background: "#160808", border: "1px solid #664444", color: "#aa6666", fontSize: 9, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit" }}>
+                          ✕ REJECT
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -708,6 +826,47 @@ export default function App() {
                     </div>
                   ))}
 
+                  {/* Weapon inventory */}
+                  {base.weapons_inventory && (
+                    <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid #0a1820" }}>
+                      <div style={{ fontSize: 7, color: "#1e4050", letterSpacing: 2, marginBottom: 4 }}>WEAPON INVENTORY</div>
+                      {Object.entries(base.weapons_inventory).map(([w, count]) => {
+                        const low = count <= 2 && w !== "cannon";
+                        const critical = count <= 1 && w.includes("missile");
+                        return (
+                          <div key={w} style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                            <span style={{ fontSize: 8, color: "#3a6070" }}>{w.replace(/_/g, " ")}</span>
+                            <span style={{ fontSize: 8, fontWeight: "bold", color: critical ? "#f87171" : low ? "#facc15" : "#4a8a7a" }}>
+                              {count} {critical ? "⚠" : ""}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Fuel stock */}
+                  {base.fuel_pct !== undefined && (
+                    <div style={{ marginTop: 6 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                        <span style={{ fontSize: 7, color: "#1e4050", letterSpacing: 2 }}>FUEL STOCK</span>
+                        <span style={{ fontSize: 8, color: fuelColor(base.fuel_pct) }}>{base.fuel_pct}%  ({(base.fuel_stock_liters||0).toLocaleString()}L)</span>
+                      </div>
+                      <div style={{ height: 3, background: "#0a1820", borderRadius: 2 }}>
+                        <div style={{ width: `${base.fuel_pct}%`, height: "100%", background: fuelColor(base.fuel_pct), borderRadius: 2 }} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Resource warnings */}
+                  {base.resource_warnings?.length > 0 && (
+                    <div style={{ marginTop: 6 }}>
+                      {base.resource_warnings.map((w, i) => (
+                        <div key={i} style={{ fontSize: 8, color: w.startsWith("CRITICAL") ? "#f87171" : "#facc15", marginTop: 2 }}>⚠ {w}</div>
+                      ))}
+                    </div>
+                  )}
+
                   {base.ground_ammo !== undefined && (
                     <div style={{ fontSize: 8, color: "#2a4050", marginTop: 4, borderTop: "1px solid #0a1820", paddingTop: 4 }}>
                       GND DEFENSE: {base.ground_ammo} rounds
@@ -719,13 +878,19 @@ export default function App() {
           )}
 
           {/* Stats */}
-          <div style={{ padding: "8px 14px", borderTop: "1px solid #0d1e2a", display: "flex", justifyContent: "space-between" }}>
+          <div style={{ padding: "8px 14px", borderTop: "1px solid #0d1e2a", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             {[["THREATS", threats.length, "#f87171"], ["DECISIONS", decisions.length, "#3fc1ff"], ["CIVILIAN", civilians.length, "#aaaaaa"]].map(([label, val, color]) => (
               <div key={label} style={{ textAlign: "center" }}>
                 <div style={{ fontSize: 8, color: "#1e3a4a", letterSpacing: 1 }}>{label}</div>
                 <div style={{ fontSize: 20, color, lineHeight: 1.2 }}>{val}</div>
               </div>
             ))}
+            <div style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 8, color: "#1e3a4a", letterSpacing: 1 }}>SPENT</div>
+              <div style={{ fontSize: sessionCost >= 1_000_000 ? 13 : 16, color: sessionCost > 5_000_000 ? "#f87171" : "#facc15", lineHeight: 1.2, fontWeight: "bold" }}>
+                ${sessionCost >= 1_000_000 ? (sessionCost / 1_000_000).toFixed(1) + "M" : sessionCost >= 1000 ? (sessionCost / 1000).toFixed(0) + "K" : sessionCost}
+              </div>
+            </div>
           </div>
 
           {/* Wave forecast panel */}
