@@ -36,12 +36,20 @@ const ALL_BASES = [...BASES.north, ...BASES.south];
 const THREAT_TYPES = ["Ballistic missile", "Strike aircraft", "Cruise missile", "Armed drone", "Fighter jet"];
 let threatCounter = 1;
 
+// Radar stations — on the three north-passage islands in the Boreal Passage
+// SVG screen positions derived from island polygon centroids (north land group, translate(0,-40))
+const RADAR_STATIONS = [
+  { id: "RAD-NW", label: "RW", svgX: 182, svgY: 376, range_km: 360 },  // NW island
+  { id: "RAD-NC", label: "RC", svgX: 394, svgY: 296, range_km: 360 },  // NC island
+  { id: "RAD-NE", label: "RE", svgX: 694, svgY: 233, range_km: 360 },  // NE island
+].map(r => ({ ...r, x: r.svgX, y: r.svgY, range_svg: r.range_km * SCALE_Y }));
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function spawnTowardTarget(spawnX, spawnY, target, type) {
   const dx = target.x - spawnX;
   const dy = target.y - spawnY;
   const len = Math.sqrt(dx * dx + dy * dy);
-  const animSpd = 1.2 + Math.random() * 1.4;
+  const animSpd = 0.28 + Math.random() * 0.18;  // ~20-30s to reach target at 60fps
   const id = `T${String(threatCounter++).padStart(3, "0")}`;
 
   // Real-world speed and ETA from km coordinates
@@ -64,6 +72,7 @@ function spawnTowardTarget(spawnX, spawnY, target, type) {
     eta: eta_seconds,
     classification: "HOSTILE",
     civilian_nearby: Math.random() > 0.78,
+    detected: false,
     age: 0,
   };
 }
@@ -88,6 +97,55 @@ function randomCivilian() {
   };
 }
 
+// ── Threat type icons ────────────────────────────────────────────────────────
+function ThreatIcon({ type, color, angle }) {
+  const c = color;
+  if (type === "Armed drone") {
+    return (
+      <g transform={`rotate(${angle})`}>
+        <circle r="2.5" fill={c} />
+        {[45, 135, 225, 315].map(a => {
+          const r = a * Math.PI / 180, ex = Math.cos(r) * 7, ey = Math.sin(r) * 7;
+          return (
+            <g key={a}>
+              <line x1={Math.cos(r)*2.5} y1={Math.sin(r)*2.5} x2={ex} y2={ey}
+                stroke={c} strokeWidth="1.5" strokeLinecap="round" />
+              <circle cx={ex} cy={ey} r="2.5" fill="none" stroke={c} strokeWidth="1" />
+            </g>
+          );
+        })}
+      </g>
+    );
+  }
+  if (type === "Ballistic missile" || type === "Cruise missile") {
+    return (
+      <g transform={`rotate(${angle})`}>
+        <polygon points="0,-11 -2,-5 2,-5" fill={c} />
+        <rect x="-2" y="-5" width="4" height="9" rx="0.5" fill={c} />
+        <polygon points="-2,3 -5,9 -1.5,6" fill={c} opacity="0.8" />
+        <polygon points="2,3 5,9 1.5,6" fill={c} opacity="0.8" />
+        {type === "Ballistic missile" && (
+          <ellipse cx="0" cy="9" rx="1.5" ry="2.5" fill="#facc15" opacity="0.7" />
+        )}
+      </g>
+    );
+  }
+  if (type === "Strike aircraft" || type === "Fighter jet") {
+    const ws = type === "Fighter jet" ? 10 : 9;
+    return (
+      <g transform={`rotate(${angle})`}>
+        <polygon points="0,-11 -1.5,4 1.5,4" fill={c} />
+        <polygon points={`-1.5,-2 -${ws},5 -1.5,5`} fill={c} opacity="0.85" />
+        <polygon points={`1.5,-2 ${ws},5 1.5,5`} fill={c} opacity="0.85" />
+        <polygon points="-1.5,4 -4,8.5 -1,6.5" fill={c} opacity="0.7" />
+        <polygon points="1.5,4 4,8.5 1,6.5" fill={c} opacity="0.7" />
+        <ellipse cx="0" cy="-6" rx="1" ry="1.8" fill="#000" opacity="0.35" />
+      </g>
+    );
+  }
+  return <polygon points="0,-8 -6,5 6,5" fill={c} stroke="#000" strokeWidth="0.8" transform={`rotate(${angle})`} />;
+}
+
 const confColor  = c => c >= 85 ? "#4ade80" : c >= 65 ? "#facc15" : "#f87171";
 const prioColor  = p => p === "immediate" ? "#f87171" : p === "urgent" ? "#facc15" : "#4ade80";
 const fuelColor  = f => f >= 70 ? "#4ade80" : f >= 40 ? "#facc15" : "#f87171";
@@ -107,7 +165,10 @@ export default function App() {
   const [intercepts,       setIntercepts]       = useState([]);
   const [pending,          setPending]          = useState([]);
   const [selected,         setSelected]         = useState(null);
-  const [running,          setRunning]          = useState(false);
+  const [running,          setRunning]          = useState(true);   // always on
+  const [autoMode,         setAutoMode]         = useState(false);  // auto-wave toggle
+  const autoModeRef = useRef(false);
+  const warModeRef  = useRef(false);
   const [loading,          setLoading]          = useState(false);
   const [apiStatus,        setApiStatus]        = useState("checking");
   const [tab,              setTab]              = useState("feed");
@@ -120,12 +181,72 @@ export default function App() {
   const [hoveredId,          setHoveredId]          = useState(null);
   const [expandedReasoning,  setExpandedReasoning]  = useState(new Set());
   const [sessionCost,        setSessionCost]        = useState(0);
-  const frameRef = useRef(null);
-  const tickRef  = useRef(0);
+  const [explosions,         setExplosions]         = useState([]);
+  const [interceptedCount,  setInterceptedCount]   = useState(0);
+  const [missedCount,       setMissedCount]        = useState(0);
+  const [timeline,          setTimeline]           = useState([]);
+  const [interceptors,      setInterceptors]      = useState([]);
+  const [warMode,           setWarMode]           = useState(false);
+  const frameRef    = useRef(null);
+  const tickRef     = useRef(0);
+  const threatPosRef = useRef({});
+  const threatsRef   = useRef([]);    // always-current snapshot for interceptor collision checks
+  const decidedThreatsRef  = useRef(new Set());   // tracks which threats have had callDecide fired
+  const callDecideFnRef    = useRef(null);         // always-current callDecide (avoids stale closure in loop)
+  const [radarsActive,     setRadarsActive]     = useState(true);
+  const radarsActiveRef    = useRef(true);
+  const spyInPassageRef    = useRef(false);        // true when a spy aircraft is in the radar zone
+
+  // Speed in SVG px/frame
+  const INTERCEPT_SPEED = { fighter: 1.4, interceptor: 1.8, drone: 0.8 };
+
+  const spawnInterceptor = (decision, threatObj) => {
+    const base = BASES.north.find(b => b.id === decision.recommended_base);
+    if (!base) return;
+    // Use the threat's CURRENT position if we have it, otherwise fall back to spawn position
+    const tid = decision.threat_id;
+    const cur = (tid && threatPosRef.current[tid]) || { x: threatObj?.x ?? 500, y: threatObj?.y ?? 650 };
+    const dx = cur.x - base.x, dy = cur.y - base.y;
+    const len = Math.sqrt(dx*dx + dy*dy) || 1;
+    const spd = INTERCEPT_SPEED[decision.recommended_asset_type] || 1.4;
+    setInterceptors(p => [...p.slice(-12), {
+      id: `icp-${decision.decision_id}-${Date.now()}`,
+      assetType: decision.recommended_asset_type || "fighter",
+      weapon: decision.recommended_weapon || "",
+      x: base.x, y: base.y,
+      vx: (dx/len)*spd, vy: (dy/len)*spd,
+      targetId: tid,
+      baseId: decision.recommended_base,
+      age: 0,
+    }]);
+  };
 
   const toggleReasoning = id => setExpandedReasoning(s => {
     const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n;
   });
+
+  const markIntercepted = (threatId) => {
+    const pos = threatPosRef.current[threatId];
+    if (pos) {
+      setExplosions(p => [...p.slice(-20), { id: `exp-${Date.now()}-${threatId}`, x: pos.x, y: pos.y, age: 0 }]);
+    }
+    setThreats(prev => {
+      const th = prev.find(t => t.id === threatId);
+      if (th && !th.intercepted) {
+        setInterceptedCount(c => c + 1);
+        setTimeline(t => [{
+          id: `int-${threatId}-${Date.now()}`, type: "intercepted", time: Date.now(),
+          label: `${th.type} intercepted → ${th.target_name}`,
+          threatType: th.type,
+        }, ...t.slice(0, 99)]);
+      }
+      return prev.map(t =>
+        t.id === threatId && !t.intercepted
+          ? { ...t, intercepted: true, intercepted_at: t.age, vx: (Math.random()-0.5)*2.5, vy: -(Math.random()*1.5+0.5) }
+          : t
+      );
+    });
+  };
 
   useEffect(() => {
     fetch(`${API}/`).then(r => setApiStatus(r.ok ? "online" : "offline")).catch(() => setApiStatus("offline"));
@@ -158,6 +279,23 @@ export default function App() {
     return () => clearInterval(iv);
   }, []);
 
+  // Auto-execute HOLD items when ETA window closes
+  useEffect(() => {
+    if (pending.length === 0) return;
+    const iv = setInterval(() => {
+      const now = Date.now() / 1000;
+      pending.forEach(p => {
+        const elapsed  = now - p.created_at;
+        const remaining = (p.threat.eta || 600) - elapsed;
+        if (remaining < 90 && remaining > 0) {
+          // Window closing — auto-approve with AI recommendation
+          handleApprove(p.decision_id);
+        }
+      });
+    }, 2000);
+    return () => clearInterval(iv);
+  }, [pending]);
+
   // Fetch wave forecast whenever waveLog changes (debounced to 30s minimum)
   useEffect(() => {
     if (waveLog.length === 0) return;
@@ -188,37 +326,170 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!running) { cancelAnimationFrame(frameRef.current); return; }
     const loop = () => {
       tickRef.current++;
       const t = tickRef.current;
-      if (t % 240 === 0) spawnThreat();
-      if (t % 420 === 0) setCivilians(p => [...p.slice(-6), randomCivilian()]);
+      // Auto-wave: only when AUTO mode is enabled
+      if (autoModeRef.current && t % 280 === 0) spawnThreat();
+      // Only spawn new civilians in peacetime; war mode clears and halts civilian traffic
+      if (!warModeRef.current && t % 420 === 0) setCivilians(p => [...p.slice(-6), randomCivilian()]);
+      // Spy flights: auto-spawn during wartime, every ~2700 frames (~45s), only if none active
+      if (warModeRef.current && t % 2700 === 0 && !spyInPassageRef.current) spawnSpyFlight();
+
+      setExplosions(prev => prev.map(e => ({ ...e, age: e.age + 1 })).filter(e => e.age < 55));
 
       setThreats(prev => {
-        const next = prev
-          .map(th => ({ ...th, x: th.x + th.vx, y: th.y + th.vy, age: th.age + 1 }))
-          .filter(th => th.x > -40 && th.x < 1040 && th.y > -40 && th.y < 830);
-        setThreatenedTargets(new Set(next.map(th => th.target_id)));
+        // Detect threats that reached their target (exit top of SVG, heading north)
+        const reached = prev.filter(th => !th.intercepted && th.y < -30 && th.vy < 0);
+        if (reached.length > 0) {
+          setMissedCount(c => c + reached.length);
+          reached.forEach(th => {
+            setTimeline(t => [{
+              id: `miss-${th.id}-${Date.now()}`, type: "missed", time: Date.now(),
+              label: `${th.type} reached ${th.target_name}`,
+              threatType: th.type,
+            }, ...t.slice(0, 99)]);
+          });
+        }
+
+        const next = prev.map(th => {
+          if (th.intercepted) {
+            // Tumble and fall under simulated gravity + drag
+            return {
+              ...th,
+              x: th.x + th.vx, y: th.y + th.vy,
+              vx: th.vx * 0.91,
+              vy: th.vy + 0.18,
+              age: th.age + 1,
+            };
+          }
+          return { ...th, x: th.x + th.vx, y: th.y + th.vy, age: th.age + 1 };
+        }).filter(th => {
+          if (th.intercepted) return (th.age - th.intercepted_at) < 90;
+          return th.x > -40 && th.x < 1040 && th.y > -40 && th.y < 830;
+        });
+
+        // Keep refs up-to-date for interceptor logic
+        const posMap = {};
+        next.forEach(th => { posMap[th.id] = { x: th.x, y: th.y }; });
+        threatPosRef.current = posMap;
+        threatsRef.current = next;
+
+        setThreatenedTargets(new Set(next.filter(th => !th.intercepted).map(th => th.target_id)));
         return next;
       });
 
-      setCivilians(prev => prev
-        .map(c => ({ ...c, x: c.x + c.vx, y: c.y + c.vy }))
-        .filter(c => c.x > -50 && c.x < 1050)
-      );
+      setCivilians(prev => {
+        const moved = prev
+          .map(c => ({ ...c, x: c.x + c.vx, y: c.y + c.vy }))
+          .filter(c => c.x > -50 && c.x < 1050);
+
+        // EMCON: spy aircraft in passage zone → silence radars
+        const spyNowPresent = moved.some(c => c.isSpy && c.y > 280 && c.y < 590);
+        if (spyNowPresent !== spyInPassageRef.current) {
+          spyInPassageRef.current = spyNowPresent;
+          radarsActiveRef.current = !spyNowPresent;
+          setTimeout(() => {
+            setRadarsActive(!spyNowPresent);
+            setTimeline(tl => [{
+              id: `emcon-${Date.now()}`, type: "emcon", time: Date.now(),
+              label: spyNowPresent
+                ? "⚠ EMCON: radars silenced — spy aircraft in range"
+                : "✓ EMCON LIFTED: radars restored",
+            }, ...tl.slice(0, 99)]);
+          }, 0);
+        }
+        return moved;
+      });
+      // ── Radar detection (outside setThreats so state updater stays pure) ──────
+      // Read current positions from ref — threatsRef updated synchronously above
+      if (radarsActiveRef.current) {
+        const nowDetected = [];
+        threatsRef.current.forEach(th => {
+          if (th.detected || th.intercepted || decidedThreatsRef.current.has(th.id)) return;
+          for (const rad of RADAR_STATIONS) {
+            const ddx = th.x - rad.x, ddy = th.y - rad.y;
+            if (Math.sqrt(ddx*ddx + ddy*ddy) <= rad.range_svg) {
+              decidedThreatsRef.current.add(th.id);
+              nowDetected.push({ ...th });
+              break;
+            }
+          }
+        });
+        if (nowDetected.length > 0) {
+          // Mark as detected in state (pure updater — no side effects)
+          const ids = new Set(nowDetected.map(th => th.id));
+          setThreats(prev => prev.map(th => ids.has(th.id) ? { ...th, detected: true } : th));
+          // Fire AI decisions and timeline events
+          setTimeout(() => {
+            nowDetected.forEach(th => {
+              callDecideFnRef.current?.(th);
+              setTimeline(tl => [{
+                id: `th-${th.id}-${Date.now()}`, type: "threat", time: Date.now(),
+                label: `RADAR CONTACT: ${th.type} → ${th.target_name}`, threatType: th.type,
+              }, ...tl.slice(0, 99)]);
+            });
+          }, 0);
+        }
+      }
+
       setIntercepts(prev => prev.map(i => ({ ...i, age: i.age + 1 })).filter(i => i.age < 160));
+
+      // Move interceptors with homing guidance — steer toward threat's current position each frame
+      setInterceptors(prev => {
+        const hit = new Set();
+        const moved = prev.map(icp => {
+          const curPos = threatPosRef.current[icp.targetId];
+          // If threat no longer tracked (intercepted/gone), keep coasting
+          if (!curPos) {
+            return { ...icp, x: icp.x + icp.vx, y: icp.y + icp.vy, age: icp.age + 1 };
+          }
+          const dx = curPos.x - icp.x, dy = curPos.y - icp.y;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          if (dist < 28) {
+            // Close enough — intercept
+            markIntercepted(icp.targetId);
+            hit.add(icp.id);
+            return icp;
+          }
+          // Recalculate velocity toward current threat position (homing)
+          const spd = INTERCEPT_SPEED[icp.assetType] || 1.4;
+          const vx = (dx/dist) * spd;
+          const vy = (dy/dist) * spd;
+          return { ...icp, x: icp.x + vx, y: icp.y + vy, vx, vy, age: icp.age + 1 };
+        });
+        return moved.filter(i => !hit.has(i.id) && i.age < 600 && i.x > -100 && i.x < 1100 && i.y > -100 && i.y < 900);
+      });
       frameRef.current = requestAnimationFrame(loop);
     };
     frameRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameRef.current);
-  }, [running]);
+  }, []);  // runs once — always on
 
   const spawnThreat = () => {
     const th = randomThreat();
     setThreats(p => [...p.slice(-15), th]);
-    callDecide(th);
-    setWaveLog(w => [...w, { time: Date.now(), count: 1, targets: [th.target_name] }]);
+    // callDecide fires when th enters radar range (handled in animation loop)
+    setWaveLog(w => [...w, { time: Date.now(), count: 1, targets: [th.target_name], types: [th.type], outcomes: [] }]);
+  };
+
+  const spawnSpyFlight = () => {
+    // Reconnaissance aircraft crosses the passage laterally — triggers EMCON
+    const fromLeft = Math.random() > 0.5;
+    const recId = `REC-${Math.floor(Math.random() * 90 + 10)}`;
+    setCivilians(p => [...p.slice(-8), {
+      id: recId,
+      isSpy: true,
+      x: fromLeft ? -15 : 1015,
+      y: 310 + Math.random() * 100,   // passage zone — inside radar range
+      vx: fromLeft ? 2.2 : -2.2,
+      vy: (Math.random() - 0.5) * 0.3,
+      speed: 820, altitude: 12000, heading: fromLeft ? 90 : 270, squawk: "none",
+    }]);
+    setTimeline(tl => [{
+      id: `spy-${Date.now()}`, type: "emcon", time: Date.now(),
+      label: `ELINT WARNING: reconnaissance aircraft ${recId} entering passage`,
+    }, ...tl.slice(0, 99)]);
   };
 
   const handleApprove = async (decisionId) => {
@@ -233,6 +504,7 @@ export default function App() {
                     threat_type: item.threat.type, timestamp: item.created_at, status: "approved" };
         const base = ALL_BASES.find(b => b.id === (override || d.recommended_base));
         if (base) setIntercepts(p => [...p.slice(-12), { id: d.decision_id, x1: base.x, y1: base.y, x2: item.threat.x, y2: item.threat.y, age: 0 }]);
+        spawnInterceptor({ ...d, recommended_base: override || d.recommended_base, threat_id: item.threat.id }, item.threat);
         setDecisions(p => [d, ...p.slice(0, 19)]);
       }
       setPending(p => p.filter(x => x.decision_id !== decisionId));
@@ -256,43 +528,118 @@ export default function App() {
       });
       const d = await res.json();
       if (d.status === "pending_approval") {
-        // Will appear via /pending poll — just switch to hold tab
-        setTab("hold");
+        setTab("feed");  // HOLD cards appear at the TOP of the feed — keep operator on feed tab
       } else {
         const base = ALL_BASES.find(b => b.id === d.recommended_base);
         if (base) setIntercepts(p => [...p.slice(-12), { id: d.decision_id, x1: base.x, y1: base.y, x2: threat.x, y2: threat.y, age: 0 }]);
+        spawnInterceptor(d, threat);
         setDecisions(p => [d, ...p.slice(0, 19)]);
       }
     } catch {
-      const base = BASES.north[Math.floor(Math.random() * BASES.north.length)];
+      // Backend offline — spatial fallback: pick nearest north base
+      const sorted = BASES.north.map(b => {
+        const dx = b.x - threat.x, dy = b.y - threat.y;
+        return { base: b, dist: Math.sqrt(dx*dx + dy*dy) };
+      }).sort((a,b) => a.dist - b.dist);
+      const base = sorted[0].base;
       const mock = {
         decision_id: `D${String(Math.floor(Math.random()*9999)).padStart(4,"0")}`,
         threat_id: threat.id, threat_type: threat.type,
         recommended_base: base.id, recommended_base_name: base.name,
         recommended_asset_type: "fighter", recommended_weapon: "long_range_missile",
         confidence: 62 + Math.floor(Math.random() * 20),
-        reasoning: "Backend offline — nearest available base selected by Euclidean distance.",
-        alternatives_rejected: [], trade_offs: "No coverage lookahead — AI offline.",
+        reasoning: `Offline fallback: ${base.name} selected as nearest base (${Math.round(sorted[0].dist)} SVG units).`,
+        alternatives_rejected: [], trade_offs: "No AI coverage analysis — operating offline.",
         civilian_risk: threat.civilian_nearby ? "medium" : "none", civilian_note: "",
-        future_risk: "Reconnect backend for full spatial decision support.",
+        future_risk: "Reconnect backend for full AI decision support.",
         priority: "urgent", timestamp: Date.now() / 1000,
+        status: "auto_executed",
       };
       setIntercepts(p => [...p.slice(-12), { id: mock.decision_id, x1: base.x, y1: base.y, x2: threat.x, y2: threat.y, age: 0 }]);
+      spawnInterceptor(mock, threat);  // also spawn interceptor in offline mode
       setDecisions(p => [mock, ...p.slice(0, 19)]);
     }
     setLoading(false);
   };
+  // Always-current ref so animation loop can call callDecide without stale closure
+  callDecideFnRef.current = callDecide;
 
-  const injectThreat = () => { const th = randomThreat(); setThreats(p => [...p.slice(-15), th]); callDecide(th); };
+  const injectThreat = () => { const th = randomThreat(); setThreats(p => [...p.slice(-15), th]); /* radar handles callDecide */ };
 
   const injectScenario = () => {
-    const spawns = [{ x: 150, y: 705 }, { x: 500, y: 720 }, { x: 860, y: 700 }];
-    const types  = ["Ballistic missile", "Strike aircraft", "Cruise missile"];
-    const wave   = TARGETS.north.map((target, i) => spawnTowardTarget(spawns[i].x, spawns[i].y, target, types[i]));
-    wave.forEach((th, i) => {
-      setTimeout(() => { setThreats(p => [...p.slice(-15), th]); callDecide(th); }, i * 600);
+    // Variable wave size 2–7
+    const waveSize = 2 + Math.floor(Math.random() * 6);
+
+    // Attack strategy — varies each wave based on prior pattern
+    const strategy = Math.random();
+    let targetPool;
+    if (strategy < 0.30) {
+      // Saturation: all threats on one city (pressure one defense node)
+      const primary = TARGETS.north[Math.floor(Math.random() * TARGETS.north.length)];
+      targetPool = Array(waveSize).fill(primary);
+    } else if (strategy < 0.60) {
+      // Focused: ~70% on one city, rest on another
+      const primary   = TARGETS.north[Math.floor(Math.random() * TARGETS.north.length)];
+      const secondary = TARGETS.north.filter(t => t.id !== primary.id)[Math.floor(Math.random() * 2)];
+      targetPool = Array.from({ length: waveSize }, (_, i) =>
+        Math.random() < 0.70 ? primary : secondary
+      );
+    } else {
+      // Dispersal: random mix across all north cities
+      targetPool = Array.from({ length: waveSize }, () =>
+        TARGETS.north[Math.floor(Math.random() * TARGETS.north.length)]
+      );
+    }
+
+    // Threat type composition — weight by wave number (escalation)
+    const MISSILE_TYPES  = ["Ballistic missile", "Cruise missile"];
+    const AIRCRAFT_TYPES = ["Strike aircraft", "Fighter jet"];
+    const ALL_TYPES      = [...MISSILE_TYPES, ...AIRCRAFT_TYPES, "Armed drone"];
+    const waveTypes = Array.from({ length: waveSize }, () =>
+      ALL_TYPES[Math.floor(Math.random() * ALL_TYPES.length)]
+    );
+
+    // Spawn positions spread across full south border
+    const wave = targetPool.map((target, i) => {
+      const spawnX = 30 + Math.random() * 940;
+      const spawnY = 660 + Math.random() * 60;
+      return spawnTowardTarget(spawnX, spawnY, target, waveTypes[i]);
     });
-    setWaveLog(w => [...w, { time: Date.now(), count: wave.length, targets: wave.map(t => t.target_name) }]);
+
+    wave.forEach((th, i) => {
+      setTimeout(() => { setThreats(p => [...p.slice(-20), th]); }, i * 500);
+    });
+
+    // Activate war mode on first wave
+    if (!warModeRef.current) {
+      warModeRef.current = true;
+      setWarMode(true);
+      setTimeout(() => {
+        setCivilians(prev => prev.slice(0, 1));
+      }, 3000);
+    }
+
+    const newEntry = {
+      time: Date.now(),
+      count: wave.length,
+      targets: wave.map(t => t.target_name),
+      types:   waveTypes,
+      outcomes: [],  // filled in after intercept results
+    };
+    setWaveLog(w => {
+      const updated = [...w, newEntry];
+      setTimeout(() => {
+        fetch(`${API}/forecast`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wave_log: updated.map(x => ({...x, now: Date.now()})), base_count: 3 }),
+        }).then(r => r.json()).then(setForecast).catch(() => {});
+      }, 800);
+      return updated;
+    });
+    setTimeline(t => [{
+      id: `wave-${Date.now()}`, type: "wave", time: Date.now(),
+      label: `Wave ${waveLog.length + 1}: ${wave.length} threats — ${[...new Set(wave.map(t => t.target_name))].join(", ")}`,
+    }, ...t.slice(0, 99)]);
   };
 
   const northStatus = aircraftStatus.filter(b => BASES.north.find(nb => nb.id === b.id));
@@ -311,38 +658,46 @@ export default function App() {
   const dim = hl !== null;
 
   return (
-    <div style={{ fontFamily: "'Courier New', monospace", background: "#040b12", color: "#b8cfd8", minHeight: "100vh", display: "flex", flexDirection: "column", fontSize: 13 }}>
+    <div style={{ fontFamily: "'Courier New', monospace", background: "#06182e", color: "#ddeef8", minHeight: "100vh", display: "flex", flexDirection: "column", fontSize: 13 }}>
 
       {/* ── Header ── */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 16px", borderBottom: "1px solid #0f2030", background: "#060e18", flexWrap: "wrap", gap: 6 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 16px", borderBottom: "1px solid #1a3a56", background: "#09203a", flexWrap: "wrap", gap: 6 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: running ? "#4ade80" : "#334155", boxShadow: running ? "0 0 8px #4ade80" : "none", transition: "all 0.3s", flexShrink: 0 }} />
-          <span style={{ fontSize: 10, letterSpacing: 3, color: "#4a7a90", fontWeight: "bold" }}>BOREAL PASSAGE AIR DEFENSE COMMAND</span>
-          <span style={{ fontSize: 9, padding: "2px 7px", background: apiStatus === "online" ? "#0a2a1a" : "#2a0a0a", color: apiStatus === "online" ? "#4ade80" : "#f87171", border: `1px solid ${apiStatus === "online" ? "#4ade80" : "#f87171"}`, letterSpacing: 1 }}>
+          <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#4ade80", boxShadow: "0 0 8px #4ade8066", flexShrink: 0 }} />
+          <span style={{ fontSize: 10, letterSpacing: 3, color: "#6ab4d8", fontWeight: "bold" }}>BOREAL PASSAGE AIR DEFENSE COMMAND</span>
+          <span style={{ fontSize: 9, padding: "2px 7px", background: apiStatus === "online" ? "#0d3020" : "#301010", color: apiStatus === "online" ? "#4ade80" : "#f87171", border: `1px solid ${apiStatus === "online" ? "#4ade80" : "#f87171"}44`, borderRadius: 2, letterSpacing: 1 }}>
             API {apiStatus.toUpperCase()}
           </span>
+          <span style={{ fontSize: 9, padding: "2px 8px", background: warMode ? "#2a0808" : "#0a1e12", color: warMode ? "#f87171" : "#4ade80", border: `1px solid ${warMode ? "#f87171" : "#4ade80"}44`, borderRadius: 2, letterSpacing: 1 }}>
+            {warMode ? "⚠ AIRSPACE CLOSED" : "✓ AIRSPACE OPEN"}
+          </span>
+          {!radarsActive && (
+            <span style={{ fontSize: 9, padding: "2px 8px", background: "#2a1800", color: "#facc15", border: "1px solid #facc1566", borderRadius: 2, letterSpacing: 1, fontWeight: "bold" }}>
+              ⚠ EMCON — RADARS SILENT
+            </span>
+          )}
           {coverageGaps.length > 0 && (
             <span style={{ fontSize: 9, padding: "2px 7px", background: "#2a1500", color: "#f87171", border: "1px solid #f87171", letterSpacing: 1 }}>
               ⚠ BASE DEPLETED: {coverageGaps.join(" ")}
             </span>
           )}
         </div>
-        <div style={{ display: "flex", gap: 5 }}>
+        <div style={{ display: "flex", gap: 6 }}>
           <button onClick={() => setShowRanges(r => !r)}
-            style={{ background: showRanges ? "#071828" : "transparent", border: `1px solid ${showRanges ? "#3fc1ff" : "#1a3a50"}`, color: showRanges ? "#3fc1ff" : "#3a6070", padding: "4px 10px", fontSize: 9, letterSpacing: 1, cursor: "pointer" }}>
+            style={{ background: showRanges ? "#0d2a44" : "#0a1e32", border: `1px solid ${showRanges ? "#3fc1ff" : "#1e4060"}`, color: showRanges ? "#3fc1ff" : "#6aaac8", padding: "5px 12px", fontSize: 9, letterSpacing: 1, cursor: "pointer", borderRadius: 3 }}>
             ◎ RANGES
           </button>
-          <button onClick={() => setRunning(r => !r)}
-            style={{ background: running ? "#0a2a1a" : "#0a1a2a", border: `1px solid ${running ? "#4ade80" : "#3fc1ff"}`, color: running ? "#4ade80" : "#3fc1ff", padding: "4px 14px", fontSize: 10, letterSpacing: 2, cursor: "pointer" }}>
-            {running ? "■ STOP" : "▶ RUN"}
-          </button>
           <button onClick={injectThreat}
-            style={{ background: "#160808", border: "1px solid #f87171", color: "#f87171", padding: "4px 14px", fontSize: 10, letterSpacing: 2, cursor: "pointer" }}>
+            style={{ background: "#2a0e0e", border: "1px solid #f87171", color: "#f87171", padding: "5px 14px", fontSize: 9, letterSpacing: 2, cursor: "pointer", borderRadius: 3 }}>
             + THREAT
           </button>
+          <button onClick={spawnSpyFlight}
+            style={{ background: "#1a1400", border: "1px solid #facc1566", color: "#a08800", padding: "5px 12px", fontSize: 9, letterSpacing: 1, cursor: "pointer", borderRadius: 3 }}>
+            ◇ SPY RECON
+          </button>
           <button onClick={injectScenario}
-            style={{ background: "#120e00", border: "1px solid #facc15", color: "#facc15", padding: "4px 14px", fontSize: 10, letterSpacing: 2, cursor: "pointer" }}>
-            ⚡ WAVE
+            style={{ background: "#2a2000", border: "2px solid #facc15", color: "#facc15", padding: "5px 18px", fontSize: 10, letterSpacing: 2, cursor: "pointer", borderRadius: 3, fontWeight: "bold" }}>
+            ⚡ LAUNCH WAVE
           </button>
         </div>
       </div>
@@ -354,7 +709,7 @@ export default function App() {
           <svg width="100%" viewBox="0 0 1000 780" xmlns="http://www.w3.org/2000/svg">
             <defs>
               <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
-                <path d="M 50 0 L 0 0 0 50" fill="none" stroke="rgba(255,255,255,0.03)" strokeWidth="0.5" />
+                <path d="M 50 0 L 0 0 0 50" fill="none" stroke="rgba(255,255,255,0.07)" strokeWidth="0.5" />
               </pattern>
               <radialGradient id="threatGlow" cx="50%" cy="50%" r="50%">
                 <stop offset="0%" stopColor="#f87171" stopOpacity="0.4" />
@@ -362,37 +717,37 @@ export default function App() {
               </radialGradient>
             </defs>
 
-            <rect width="1000" height="780" fill="#05111c" />
+            <rect width="1000" height="780" fill="#0b2240" />
             <rect width="1000" height="780" fill="url(#grid)" />
 
             {/* North land */}
             <g transform="translate(0,-40)">
-              <polygon fill="#162316" stroke="#111" strokeWidth="1.5"
+              <polygon fill="#1e4020" stroke="#0d1a0d" strokeWidth="1.5"
                 points="0,40 1000,40 1000,210 920,228 860,214 800,210 742,245 678,230 616,218 556,252 488,234 428,228 366,260 302,232 236,240 178,270 118,244 54,252 0,268" />
-              <polygon fill="#162316" stroke="#111" strokeWidth="1"
+              <polygon fill="#1e4020" stroke="#0d1a0d" strokeWidth="1"
                 points="355,308 378,296 410,298 424,318 436,336 426,362 406,368 386,374 362,358 354,338" />
-              <polygon fill="#162316" stroke="#111" strokeWidth="1"
+              <polygon fill="#1e4020" stroke="#0d1a0d" strokeWidth="1"
                 points="678,254 692,244 710,248 716,264 722,278 712,294 696,296 680,298 668,284 668,268" />
-              <polygon fill="#162316" stroke="#111" strokeWidth="1.2"
+              <polygon fill="#1e4020" stroke="#0d1a0d" strokeWidth="1.2"
                 points="148,395 160,382 180,378 196,386 212,394 220,412 216,430 198,456 182,454 166,452 152,438 148,420" />
             </g>
 
             {/* South land */}
             <g transform="translate(0,40)">
-              <polygon fill="#1e1a0e" stroke="#111" strokeWidth="1.5"
+              <polygon fill="#2e2810" stroke="#181208" strokeWidth="1.5"
                 points="0,740 1000,740 1000,600 948,576 882,588 818,602 756,568 688,582 624,600 560,566 492,586 428,606 362,572 294,582 232,608 168,578 98,590 30,608 0,598" />
-              <polygon fill="#1e1a0e" stroke="#111" strokeWidth="1"
+              <polygon fill="#2e2810" stroke="#181208" strokeWidth="1"
                 points="818,388 842,376 870,382 876,402 882,420 866,440 846,440 826,440 810,424 812,406" />
-              <polygon fill="#1e1a0e" stroke="#111" strokeWidth="1"
+              <polygon fill="#2e2810" stroke="#181208" strokeWidth="1"
                 points="238,494 256,482 276,488 280,506 284,522 270,536 253,536 236,534 224,520 226,504" />
-              <polygon fill="#1e1a0e" stroke="#111" strokeWidth="1"
+              <polygon fill="#2e2810" stroke="#181208" strokeWidth="1"
                 points="530,496 546,480 568,466 566,444 564,424 542,416 526,430 510,444 510,478 530,496" />
             </g>
 
             {/* Country / passage labels */}
-            <text x="500" y="28"  fill="rgba(180,220,180,0.18)" fontSize="10" fontWeight="bold" textAnchor="middle" letterSpacing="5">COUNTRY X — NORTHERN TERRITORIES</text>
-            <text x="500" y="770" fill="rgba(220,200,150,0.18)" fontSize="10" fontWeight="bold" textAnchor="middle" letterSpacing="5">COUNTRY Y — SOUTHERN UNION</text>
-            <text x="500" y="410" fill="rgba(180,210,240,0.04)" fontSize="26" fontWeight="bold" textAnchor="middle" letterSpacing="6">THE BOREAL PASSAGE</text>
+            <text x="500" y="28"  fill="rgba(160,220,160,0.35)" fontSize="10" fontWeight="bold" textAnchor="middle" letterSpacing="5">COUNTRY X — NORTHERN TERRITORIES</text>
+            <text x="500" y="770" fill="rgba(220,200,140,0.35)" fontSize="10" fontWeight="bold" textAnchor="middle" letterSpacing="5">COUNTRY Y — SOUTHERN UNION</text>
+            <text x="500" y="410" fill="rgba(180,210,240,0.08)" fontSize="28" fontWeight="bold" textAnchor="middle" letterSpacing="6">THE BOREAL PASSAGE</text>
 
             {/* Range rings */}
             {showRanges && BASES.north.map(b => (
@@ -402,8 +757,41 @@ export default function App() {
               </g>
             ))}
 
-            {/* Threat trajectory lines */}
-            {threats.map(th => {
+            {/* Radar stations — on the north passage islands */}
+            {RADAR_STATIONS.map((rad, ri) => {
+              const col = radarsActive ? "#22c55e" : "#facc15";
+              const colFade = radarsActive ? "rgba(34,197,94," : "rgba(250,204,21,";
+              return (
+                <g key={rad.id} opacity={radarsActive ? 0.8 : 0.6}>
+                  {/* Detection range ring */}
+                  <circle cx={rad.x} cy={rad.y} r={rad.range_svg} fill="none" stroke={col} strokeWidth="0.7"
+                    strokeDasharray={radarsActive ? "8 6" : "4 4"} opacity={radarsActive ? 0.16 : 0.22}>
+                    <animate attributeName="opacity"
+                      values={radarsActive ? "0.12;0.22;0.12" : "0.18;0.08;0.18"}
+                      dur={`${3 + ri * 0.7}s`} repeatCount="indefinite" />
+                  </circle>
+                  {/* Sweep line — only when radars active */}
+                  {radarsActive && (
+                    <line x1={rad.x} y1={rad.y} x2={rad.x} y2={rad.y - rad.range_svg}
+                      stroke={col} strokeWidth="1" opacity="0.2" strokeLinecap="round">
+                      <animateTransform attributeName="transform" type="rotate"
+                        from={`0 ${rad.x} ${rad.y}`} to={`360 ${rad.x} ${rad.y}`}
+                        dur={`${5 + ri}s`} repeatCount="indefinite" />
+                    </line>
+                  )}
+                  {/* Station icon */}
+                  <circle cx={rad.x} cy={rad.y} r="4" fill={col} opacity="0.6" />
+                  <line x1={rad.x} y1={rad.y - 4} x2={rad.x} y2={rad.y - 10} stroke={col} strokeWidth="1" opacity="0.7" />
+                  <line x1={rad.x - 5} y1={rad.y - 9} x2={rad.x + 5} y2={rad.y - 9} stroke={col} strokeWidth="0.8" opacity="0.7" />
+                  <text x={rad.x + 7} y={rad.y + 3} fill={`${colFade}0.55)`} fontSize="6" letterSpacing="0.5">
+                    {radarsActive ? rad.label : "EMCON"}
+                  </text>
+                </g>
+              );
+            })}
+
+            {/* Threat trajectory lines — only for detected threats */}
+            {threats.filter(th => th.detected).map(th => {
               const isHl = hl?.threatId === th.id;
               return (
                 <line key={`traj-${th.id}`} x1={th.x} y1={th.y} x2={th.target_x} y2={th.target_y}
@@ -494,8 +882,19 @@ export default function App() {
               </g>
             ))}
 
-            {/* Civilians */}
-            {civilians.map(c => (
+            {/* Civilians + spy flights */}
+            {civilians.map(c => c.isSpy ? (
+              <g key={c.id} transform={`translate(${c.x},${c.y})`} opacity={dim ? 0.15 : 1}>
+                {/* Spy aircraft — amber diamond */}
+                <polygon points="0,-8 6,0 0,8 -6,0" fill="#facc1522" stroke="#facc15" strokeWidth="1.2" />
+                <circle r="14" fill="none" stroke="#facc15" strokeWidth="0.5" strokeDasharray="3 3" opacity="0.4">
+                  <animate attributeName="r" values="12;18;12" dur="2s" repeatCount="indefinite" />
+                  <animate attributeName="opacity" values="0.4;0.1;0.4" dur="2s" repeatCount="indefinite" />
+                </circle>
+                <text y="-12" fill="#facc15" fontSize="7" textAnchor="middle" fontWeight="bold">{c.id}</text>
+                <text y="18" fill="rgba(250,204,21,0.6)" fontSize="6" textAnchor="middle">RECON</text>
+              </g>
+            ) : (
               <g key={c.id} transform={`translate(${c.x},${c.y})`} opacity={dim ? 0.07 : 1} style={{ transition: "opacity 0.25s" }}>
                 <circle r="5" fill="none" stroke="rgba(255,255,255,0.45)" strokeWidth="1" />
                 <circle r="2" fill="rgba(255,255,255,0.55)" />
@@ -503,23 +902,107 @@ export default function App() {
               </g>
             ))}
 
+            {/* Interceptor vehicles — friendly assets in flight */}
+            {interceptors.map(icp => {
+              const angle = Math.atan2(icp.vy, icp.vx) * 180 / Math.PI + 90;
+              const isHl  = hl?.baseId === icp.baseId;
+              const iconType = icp.assetType === "interceptor" ? "Cruise missile"
+                             : icp.assetType === "drone"       ? "Armed drone"
+                             : "Strike aircraft";
+              const trail = Math.min(icp.age * 0.4, 12);
+              return (
+                <g key={icp.id} transform={`translate(${icp.x},${icp.y})`}
+                  opacity={dim && !isHl ? 0.15 : 1} style={{ transition: "opacity 0.2s" }}>
+                  {/* Engine exhaust trail */}
+                  <line x1={0} y1={0} x2={-icp.vx * trail} y2={-icp.vy * trail}
+                    stroke="#3fc1ff" strokeWidth="1.5" opacity="0.35" strokeLinecap="round" />
+                  {/* Glow */}
+                  <circle r="8" fill="none" stroke="#3fc1ff" strokeWidth="0.5" opacity="0.2" />
+                  {/* Vehicle icon in friendly blue */}
+                  <ThreatIcon type={iconType} color="#3fc1ff" angle={angle} />
+                  {/* Weapon label */}
+                  <text y="-15" fill="rgba(63,193,255,0.6)" fontSize="6" textAnchor="middle">{icp.baseId}</text>
+                </g>
+              );
+            })}
+
             {/* Threats */}
             {threats.map(th => {
               const isHl = hl?.threatId === th.id;
+              const dwnAge = th.intercepted ? th.age - th.intercepted_at : 0;
+              const dwnOpacity = th.intercepted ? Math.max(0, 1 - dwnAge / 75) : 1;
+              const tumbleAngle = th.intercepted
+                ? dwnAge * 11
+                : Math.atan2(th.vy, th.vx) * 180 / Math.PI + 90;
+
+              // Undetected: render as anonymous radar blip — operator sees contact but doesn't know type/target
+              if (!th.detected && !th.intercepted) {
+                const blipR = 4 + 2 * Math.sin(th.age * 0.18);
+                return (
+                  <g key={th.id} transform={`translate(${th.x},${th.y})`} opacity={dim ? 0.06 : 0.45}>
+                    <circle r={blipR + 6} fill="none" stroke="#facc15" strokeWidth="0.5" opacity="0.3">
+                      <animate attributeName="r" values={`${blipR+4};${blipR+12};${blipR+4}`} dur="1.8s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" values="0.3;0.0;0.3" dur="1.8s" repeatCount="indefinite" />
+                    </circle>
+                    <circle r={blipR} fill="#facc1544" stroke="#facc15" strokeWidth="0.8" />
+                    <text y="-9" fill="rgba(250,204,21,0.5)" fontSize="6" textAnchor="middle">?</text>
+                  </g>
+                );
+              }
+
               return (
                 <g key={th.id} transform={`translate(${th.x},${th.y})`}
-                  opacity={dim && !isHl ? 0.1 : 1} style={{ transition: "opacity 0.25s" }}>
-                  {isHl && (
+                  opacity={(dim && !isHl ? 0.1 : 1) * dwnOpacity}
+                  style={{ transition: th.intercepted ? "none" : "opacity 0.25s" }}>
+                  {isHl && !th.intercepted && (
                     <circle r="22" fill="none" stroke="#f87171" strokeWidth="1" opacity="0.4">
                       <animate attributeName="r" values="16;28;16" dur="1.2s" repeatCount="indefinite" />
                       <animate attributeName="opacity" values="0.5;0.1;0.5" dur="1.2s" repeatCount="indefinite" />
                     </circle>
                   )}
-                  <circle r={isHl ? 18 : 14} fill="url(#threatGlow)" opacity={0.5 + 0.5 * Math.sin(th.age * 0.15)} />
-                  <polygon points="0,-8 -7,5 7,5" fill="#f87171" stroke="#000" strokeWidth="0.8"
-                    transform={`rotate(${Math.atan2(th.vy, th.vx) * 180 / Math.PI + 90})`} />
-                  <text y="-13" fill={isHl ? "#ff6060" : "#f87171"} fontSize="7.5" textAnchor="middle" fontWeight="bold">{th.id}</text>
-                  <text y="21" fill="rgba(248,113,113,0.55)" fontSize="6.5" textAnchor="middle">→ {th.target_name} · {formatETA(Math.max(0, th.eta - Math.floor(th.age / 60)))}</text>
+                  <circle r={isHl && !th.intercepted ? 18 : 14} fill="url(#threatGlow)"
+                    opacity={th.intercepted ? 0.2 : 0.5 + 0.5 * Math.sin(th.age * 0.15)} />
+                  {th.intercepted && dwnAge < 40 && [0,72,144,216,288].map(a => {
+                    const r2 = a * Math.PI / 180, d2 = dwnAge * 0.6;
+                    return <line key={a} x1={0} y1={0} x2={Math.cos(r2)*d2} y2={Math.sin(r2)*d2}
+                      stroke="#facc15" strokeWidth="1" opacity={0.8 - dwnAge/40} />;
+                  })}
+                  <ThreatIcon
+                    type={th.type}
+                    color={th.intercepted ? "#555" : isHl ? "#ff6060" : "#f87171"}
+                    angle={tumbleAngle} />
+                  {!th.intercepted && (
+                    <>
+                      <text y="-13" fill={isHl ? "#ff6060" : "#f87171"} fontSize="7.5" textAnchor="middle" fontWeight="bold">{th.id}</text>
+                      <text y="21" fill="rgba(248,113,113,0.55)" fontSize="6.5" textAnchor="middle">→ {th.target_name} · {formatETA(Math.max(0, th.eta - Math.floor(th.age / 60)))}</text>
+                    </>
+                  )}
+                  {th.intercepted && dwnAge < 20 && (
+                    <text y="-16" fill="#facc15" fontSize="8" textAnchor="middle" fontWeight="bold">✕</text>
+                  )}
+                </g>
+              );
+            })}
+
+            {/* Explosion bursts */}
+            {explosions.map(e => {
+              const p = e.age / 55;
+              const flash = e.age < 8;
+              return (
+                <g key={e.id} transform={`translate(${e.x},${e.y})`}>
+                  {flash && <circle r={20 - e.age * 1.5} fill="#ffffff" opacity={(8 - e.age) / 8 * 0.9} />}
+                  <circle r={4 + p * 34} fill="none" stroke="#facc15" strokeWidth={2.5 * (1-p)} opacity={(1-p) * 0.9} />
+                  <circle r={2 + p * 22} fill="none" stroke="#f87171" strokeWidth={2 * (1-p)} opacity={(1-p) * 0.7} />
+                  <circle r={p * 12} fill="none" stroke="#ff8855" strokeWidth={1.5 * (1-p)} opacity={(1-p) * 0.5} />
+                  {[0,60,120,180,240,300].map(angle => {
+                    const rad = angle * Math.PI / 180;
+                    const dist = p * 28;
+                    return (
+                      <circle key={angle}
+                        cx={Math.cos(rad) * dist} cy={Math.sin(rad) * dist}
+                        r={Math.max(0, 2 - p * 1.5)} fill="#facc15" opacity={1-p} />
+                    );
+                  })}
                 </g>
               );
             })}
@@ -549,102 +1032,281 @@ export default function App() {
         </div>
 
         {/* ── RIGHT PANEL ── */}
-        <div style={{ width: 320, background: "#060e18", borderLeft: "1px solid #0d1e2a", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+        <div style={{ width: 330, background: "#0a1e34", borderLeft: "1px solid #1a3a56", display: "flex", flexDirection: "column", flexShrink: 0 }}>
 
-          <div style={{ display: "flex", borderBottom: "1px solid #0d1e2a" }}>
-            {[["feed","AI DECISIONS"], ["hold","HOLD"], ["state","BASES"]].map(([t, label]) => (
-              <button key={t} onClick={() => setTab(t)}
-                style={{ flex: 1, padding: "8px 0", position: "relative", background: tab === t ? "#0a1820" : "transparent", border: "none", borderBottom: tab === t ? `2px solid ${t === "hold" ? "#f87171" : "#3fc1ff"}` : "2px solid transparent", color: tab === t ? (t === "hold" ? "#f87171" : "#3fc1ff") : "#3a5a6a", fontSize: 9, letterSpacing: 2, cursor: "pointer" }}>
-                {label}
-                {t === "hold" && pending.length > 0 && (
-                  <span style={{ position: "absolute", top: 4, right: 6, background: "#f87171", color: "#000", borderRadius: "50%", width: 14, height: 14, fontSize: 8, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: "bold" }}>
-                    {pending.length}
-                  </span>
-                )}
-              </button>
+          {/* Situation awareness strip — one-glance status */}
+          <div style={{ display: "flex", gap: 0, borderBottom: "1px solid #0a1820", background: "#081c30" }}>
+            {[
+              { label: "THREATS", val: threats.filter(t => t.detected && !t.intercepted).length, color: threats.filter(t=>t.detected&&!t.intercepted).length > 0 ? "#f87171" : "#5aaac8" },
+              { label: "HOLD",    val: pending.length,  color: pending.length > 0 ? "#facc15" : "#5aaac8" },
+              { label: "RATE",    val: interceptedCount + missedCount > 0 ? `${Math.round(interceptedCount/(interceptedCount+missedCount)*100)}%` : "—", color: (() => { const r=interceptedCount+missedCount>0?interceptedCount/(interceptedCount+missedCount)*100:null; return r===null?"#5aaac8":r>=70?"#4ade80":r>=40?"#facc15":"#f87171"; })() },
+              { label: "SPENT",   val: sessionCost>=1e6?`$${(sessionCost/1e6).toFixed(1)}M`:sessionCost>=1000?`$${Math.round(sessionCost/1000)}K`:"$0", color: sessionCost>5e6?"#f87171":sessionCost>1e6?"#facc15":"#4a7a6a" },
+            ].map(({ label, val, color }) => (
+              <div key={label} style={{ flex: 1, padding: "5px 0", textAlign: "center", borderRight: "1px solid #0a1820" }}>
+                <div style={{ fontSize: 7.5, color: "#7ab8d0", letterSpacing: 1, marginBottom: 1 }}>{label}</div>
+                <div style={{ fontSize: 14, fontWeight: "bold", color, lineHeight: 1 }}>{val}</div>
+              </div>
             ))}
           </div>
 
-          {/* Decision feed */}
+          {/* Tab bar — HOLD removed, pending items live inside FEED */}
+          <div style={{ display: "flex", borderBottom: "1px solid #0d2238", background: "#0b1e32" }}>
+            {[["feed","FEED"],["state","BASES"],["stats","STATS"],["log","LOG"]].map(([t, label]) => {
+              const activeColor = t==="stats"?"#4ade80":t==="log"?"#facc15":"#3fc1ff";
+              return (
+                <button key={t} onClick={() => setTab(t)}
+                  style={{ flex: 1, padding: "7px 0", position: "relative", background: tab===t?"#0d2238":"transparent", border: "none", borderBottom: tab===t?`2px solid ${activeColor}`:"2px solid transparent", color: tab===t?activeColor:"#5a9ab8", fontSize: 8, letterSpacing: 1, cursor: "pointer", fontFamily: "inherit", fontWeight: tab===t?"bold":"normal" }}>
+                  {label}
+                  {t==="feed" && pending.length>0 && (
+                    <span style={{ position:"absolute", top:3, right:3, background:"#facc15", color:"#000", borderRadius:"50%", width:13, height:13, fontSize:7.5, display:"flex", alignItems:"center", justifyContent:"center", fontWeight:"bold" }}>
+                      {pending.length}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* ── DECISIONS feed (lighter card theme) ── */}
           {tab === "feed" && (
-            <div style={{ flex: 1, overflowY: "auto" }}>
+            <div style={{ flex: 1, overflowY: "auto", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 6 }}>
+
+              {/* AI wave forecast intel card */}
+              {forecast && waveLog.length > 0 && (
+                <div style={{ background: "#0e1a0a", border: "1px solid #1e3a14", borderLeft: "3px solid #4ade80", borderRadius: 4, padding: "8px 10px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 9, color: "#4ade80" }}>◈</span>
+                      <span style={{ fontSize: 7.5, color: "#4ade80", letterSpacing: 2, fontWeight: "bold" }}>AI WAVE FORECAST</span>
+                    </div>
+                    <span style={{ fontSize: 7, padding: "1px 6px", background: riskColor(forecast.risk_level)+"22", color: riskColor(forecast.risk_level), border: `1px solid ${riskColor(forecast.risk_level)}44`, borderRadius: 2, letterSpacing: 1 }}>
+                      {(forecast.risk_level||"unknown").toUpperCase()}
+                    </span>
+                  </div>
+
+                  {/* Next wave ETA — hero number */}
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+                    <div>
+                      <div style={{ fontSize: 7, color: "#2a5a2a", letterSpacing: 1, marginBottom: 1 }}>NEXT WAVE IN ~</div>
+                      <div style={{ fontSize: 26, fontWeight: "bold", color: forecast.next_wave_estimate_min != null ? "#4ade80" : "#2a5a2a", lineHeight: 1 }}>
+                        {forecast.next_wave_estimate_min != null ? `${forecast.next_wave_estimate_min}m` : "—"}
+                      </div>
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      {forecast.predicted_targets?.length > 0 && (
+                        <div style={{ marginBottom: 3 }}>
+                          <span style={{ fontSize: 7, color: "#2a5a2a", letterSpacing: 1 }}>TARGET  </span>
+                          <span style={{ fontSize: 8.5, color: "#facc15" }}>{forecast.predicted_targets.join(", ")}</span>
+                        </div>
+                      )}
+                      {forecast.predicted_wave_size != null && (
+                        <div style={{ marginBottom: 3 }}>
+                          <span style={{ fontSize: 7, color: "#2a5a2a", letterSpacing: 1 }}>WAVE SIZE  </span>
+                          <span style={{ fontSize: 8.5, color: "#f87171" }}>~{forecast.predicted_wave_size} threats</span>
+                        </div>
+                      )}
+                      {forecast.threat_types_expected?.length > 0 && (
+                        <div style={{ marginBottom: 3, display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 7, color: "#2a5a2a", letterSpacing: 1 }}>EXPECT  </span>
+                          <div style={{ display: "flex", gap: 4 }}>
+                            {forecast.threat_types_expected.map(tt => (
+                              <span key={tt} style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                                <svg width="10" height="10" viewBox="-12 -12 24 24">
+                                  <ThreatIcon type={tt} color="#f87171" angle={0} />
+                                </svg>
+                                <span style={{ fontSize: 7.5, color: "#a8ccd8" }}>{tt.split(" ")[0]}</span>
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Readiness recommendation */}
+                  {forecast.recommended_readiness && (
+                    <div style={{ fontSize: 8, color: "#5a9a5a", lineHeight: 1.5, paddingTop: 5, borderTop: "1px solid #1a3010" }}>
+                      {forecast.recommended_readiness}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* HOLD items — Arktholm (priority 10) first, then by ETA ascending */}
+              {[...pending].sort((a, b) => {
+                const priA = a.threat?.target_name === "Arktholm" ? 10 : 6;
+                const priB = b.threat?.target_name === "Arktholm" ? 10 : 6;
+                if (priB !== priA) return priB - priA;           // higher priority first
+                return (a.threat?.eta || 999) - (b.threat?.eta || 999);  // sooner ETA first
+              }).map(p => {
+                const d = p.decision;
+                const elapsed   = Math.floor((Date.now() / 1000) - p.created_at);
+                const totalEta  = p.threat.eta || 600;
+                const remaining = Math.max(0, totalEta - elapsed);
+                const etaColor  = remaining < 120 ? "#f87171" : remaining < 300 ? "#facc15" : "#4ade80";
+                const autoIn    = Math.max(0, remaining - 90);
+                const isCapital = p.threat?.target_name === "Arktholm";
+                return (
+                  <div key={p.decision_id}
+                    onMouseEnter={() => setHoveredId(p.decision_id)}
+                    onMouseLeave={() => setHoveredId(null)}
+                    style={{ background: isCapital ? "#1a0800" : "#1a1200", border: `1px solid ${isCapital ? "#f87171" : "#3a2800"}`, borderLeft: `3px solid ${isCapital ? "#f87171" : "#facc15"}`, borderRadius: 4, overflow: "hidden" }}>
+                    {isCapital && (
+                      <div style={{ background: "#f871711a", borderBottom: "1px solid #f8717140", padding: "3px 10px", display: "flex", alignItems: "center", gap: 5 }}>
+                        <span style={{ fontSize: 7.5, color: "#f87171", fontWeight: "bold", letterSpacing: 2 }}>★ CAPITAL — PRIORITY INTERCEPT</span>
+                      </div>
+                    )}
+                    {/* Top strip: threat + ETA */}
+                    <div style={{ padding: "8px 10px 6px", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
+                          <svg width="13" height="13" viewBox="-12 -12 24 24">
+                            <ThreatIcon type={p.threat.type} color={isCapital ? "#f87171" : "#facc15"} angle={0} />
+                          </svg>
+                          <span style={{ fontSize: 9, color: "#f8f0c0", fontWeight: "bold", letterSpacing: 1 }}>{p.threat.id}</span>
+                          <span style={{ fontSize: 7, padding: "1px 6px", background: isCapital ? "#3a0808" : "#3a2800", color: isCapital ? "#f87171" : "#facc15", border: `1px solid ${isCapital ? "#f8717160" : "#facc1560"}`, borderRadius: 2, letterSpacing: 1 }}>REVIEW</span>
+                        </div>
+                        <div style={{ fontSize: 9, color: "#d4c060", marginBottom: 3 }}>
+                          {p.threat.type} → <span style={{ color: isCapital ? "#ff9090" : "#ffe060", fontWeight: "bold" }}>{p.threat.target_name}</span>
+                        </div>
+                        {p.approval_reasons.map((r, i) => (
+                          <div key={i} style={{ fontSize: 7.5, color: "#a09030", marginBottom: 1 }}>⚠ {r}</div>
+                        ))}
+                      </div>
+                      {/* ETA — primary signal */}
+                      <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 8 }}>
+                        <div style={{ fontSize: 7, color: "#7a6a30", letterSpacing: 1, marginBottom: 1 }}>IMPACT IN</div>
+                        <div style={{ fontSize: 24, fontWeight: "bold", color: etaColor, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>{formatETA(remaining)}</div>
+                        <div style={{ fontSize: 7, color: autoIn > 0 ? "#7a6a30" : "#f87171", marginTop: 2 }}>
+                          {autoIn > 0 ? `auto ${formatETA(autoIn)}` : "AUTO-EXECUTING"}
+                        </div>
+                      </div>
+                    </div>
+                    {/* ETA bar */}
+                    <div style={{ height: 2, background: "#1a1000" }}>
+                      <div style={{ width:`${(remaining/totalEta)*100}%`, height:"100%", background: etaColor, transition:"width 1s linear" }} />
+                    </div>
+                    {/* Recommendation */}
+                    <div style={{ padding: "5px 10px 3px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <div>
+                        <span style={{ fontSize: 9, color: "#3fc1ff", fontWeight: "bold" }}>{d.recommended_base_name?.split(" ").slice(0,2).join(" ")}</span>
+                        <span style={{ fontSize: 7.5, color: "#3a6070", marginLeft: 6 }}>{(d.recommended_weapon||"").replace(/_/g," ")} · {d.recommended_asset_type}</span>
+                      </div>
+                      <span style={{ fontSize: 8, color: confColor(d.confidence), fontWeight: "bold" }}>{d.confidence}%</span>
+                    </div>
+                    {/* Override dropdown + action buttons */}
+                    <div style={{ padding: "4px 8px 8px", display: "flex", gap: 5 }}>
+                      <select value={overrideBase[p.decision_id]||""} onChange={e => setOverrideBase(o=>({...o,[p.decision_id]:e.target.value||undefined}))}
+                        style={{ flex: 1, background:"#0d1820", border:"1px solid #1a2e3a", color: overrideBase[p.decision_id]?"#3fc1ff":"#5a9ab8", padding:"3px 6px", fontSize:8, fontFamily:"inherit", borderRadius:2 }}>
+                        <option value="">AI: {d.recommended_base}</option>
+                        {BASES.north.map(b => <option key={b.id} value={b.id}>{b.id} — {b.name}</option>)}
+                      </select>
+                      <button onClick={()=>handleApprove(p.decision_id)}
+                        style={{ padding:"4px 10px", background:"#071f0f", border:"1px solid #4ade80", color:"#4ade80", fontSize:8, letterSpacing:1, cursor:"pointer", fontFamily:"inherit", borderRadius:2 }}>
+                        ✓ APPROVE
+                      </button>
+                      <button onClick={()=>handleReject(p.decision_id)}
+                        style={{ padding:"4px 8px", background:"#160808", border:"1px solid #664444", color:"#aa6666", fontSize:8, cursor:"pointer", fontFamily:"inherit", borderRadius:2 }}>
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+
               {loading && (
-                <div style={{ padding: "8px 14px", background: "#0a1820", borderBottom: "1px solid #0d1e2a", fontSize: 9, color: "#facc15", letterSpacing: 1 }}>
-                  ◌ AI PROCESSING...
+                <div style={{ padding: "6px 10px", background: "#0a1c2c", border: "1px solid #1a3040", borderRadius: 4, fontSize: 8, color: "#facc15", letterSpacing: 1, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>◌</span> AI PROCESSING...
                 </div>
               )}
               {decisions.length === 0 && !loading && (
-                <div style={{ padding: "60px 0", textAlign: "center", color: "#1a3a4a", fontSize: 10, letterSpacing: 1 }}>
-                  NO ACTIVE THREATS
-                </div>
+                <div style={{ padding: "60px 0", textAlign: "center", color: "#4a7890", fontSize: 10, letterSpacing: 1 }}>NO ACTIVE THREATS</div>
               )}
               {decisions.map((d, i) => {
                 const isSelected = selected === d.decision_id;
                 const isHovered  = hoveredId === d.decision_id;
+                const pCol = prioColor(d.priority);
                 return (
                   <div key={d.decision_id}
-                    onClick={() => setSelected(isSelected ? null : d.decision_id)}
                     onMouseEnter={() => setHoveredId(d.decision_id)}
                     onMouseLeave={() => setHoveredId(null)}
-                    style={{ padding: "10px 14px", borderBottom: "1px solid #080e16", cursor: "pointer",
-                      background: isSelected ? "#0b2030" : isHovered ? "#071520" : i === 0 ? "rgba(248,113,113,0.03)" : "transparent",
-                      borderLeft: isHovered ? "2px solid #3fc1ff" : "2px solid transparent",
-                      transition: "background 0.15s, border-left 0.15s" }}>
+                    style={{
+                      background: isSelected ? "#1a3454" : isHovered ? "#162e4a" : "#122840",
+                      border: `1px solid ${isSelected ? "#2e5278" : isHovered ? "#264870" : "#1e3e60"}`,
+                      borderLeft: `3px solid ${pCol}`,
+                      borderRadius: 4,
+                      overflow: "hidden",
+                      cursor: "pointer",
+                      transition: "background 0.15s, border-color 0.15s",
+                    }}>
 
-                    {/* Row 1: threat ID + priority + time */}
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
-                      <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
-                        <span style={{ fontSize: 9, color: "#f87171", letterSpacing: 1, fontWeight: "bold" }}>{d.threat_id}</span>
-                        <span style={{ fontSize: 7, padding: "1px 5px", background: prioColor(d.priority) + "22", color: prioColor(d.priority), border: `1px solid ${prioColor(d.priority)}44`, letterSpacing: 1 }}>
-                          {(d.priority || "urgent").toUpperCase()}
+                    {/* Card header: threat icon + ID + priority + time */}
+                    <div onClick={() => setSelected(isSelected ? null : d.decision_id)}
+                      style={{ padding: "8px 10px 6px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          {/* Inline threat icon */}
+                          <svg width="14" height="14" viewBox="-12 -12 24 24" style={{ flexShrink: 0 }}>
+                            <ThreatIcon type={d.threat_type} color="#f87171" angle={0} />
+                          </svg>
+                          <span style={{ fontSize: 9, color: "#e8f0f5", letterSpacing: 1, fontWeight: "bold" }}>{d.threat_id}</span>
+                          <span style={{ fontSize: 7, padding: "1px 5px", background: pCol+"28", color: pCol, border: `1px solid ${pCol}55`, borderRadius: 2, letterSpacing: 1 }}>
+                            {(d.priority||"urgent").toUpperCase()}
+                          </span>
+                          {d.status === "approved"      && <span style={{ fontSize: 7, color: "#4ade80", letterSpacing: 0.5 }}>✓ HUM</span>}
+                          {d.status === "auto_executed" && <span style={{ fontSize: 7, color: "#3fc1ff", letterSpacing: 0.5 }}>⚡ AUTO</span>}
+                        </div>
+                        <span style={{ fontSize: 7.5, color: "#3a5a70", fontVariantNumeric: "tabular-nums" }}>{new Date(d.timestamp*1000).toLocaleTimeString("en-GB")}</span>
+                      </div>
+
+                      {/* Threat type → target + base */}
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <span style={{ fontSize: 9.5, color: "#b8d4e0" }}>{d.threat_type}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 7, color: "#5aaac8" }}>→</span>
+                          <span style={{ fontSize: 9.5, color: "#3fc1ff", fontWeight: "bold" }}>
+                            {d.recommended_base_name?.split(" ").slice(0,2).join(" ")}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Weapon + asset type + confidence bar */}
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 7.5, color: "#3a6070", flexShrink: 0 }}>
+                          {(d.recommended_weapon||"").replace(/_/g," ")} · {d.recommended_asset_type}
                         </span>
-                        {d.status === "approved" && <span style={{ fontSize: 7, color: "#4ade80", opacity: 0.6 }}>✓ APPROVED</span>}
-                        {d.status === "auto_executed" && <span style={{ fontSize: 7, color: "#3fc1ff", opacity: 0.5 }}>AUTO</span>}
+                        <div style={{ flex: 1, height: 3, background: "#0d2238", borderRadius: 2 }}>
+                          <div style={{ width:`${d.confidence}%`, height:"100%", background:confColor(d.confidence), borderRadius:2, transition:"width 0.5s" }} />
+                        </div>
+                        <span style={{ fontSize: 8.5, color: confColor(d.confidence), fontWeight:"bold", minWidth:24 }}>{d.confidence}%</span>
                       </div>
-                      <span style={{ fontSize: 8, color: "#1e3a4a" }}>{new Date(d.timestamp * 1000).toLocaleTimeString("en-GB")}</span>
                     </div>
 
-                    {/* Row 2: threat type → base */}
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-                      <span style={{ fontSize: 10, color: "#7a9aaa" }}>{d.threat_type}</span>
-                      <span style={{ fontSize: 10, color: "#3fc1ff", fontWeight: "bold" }}>{d.recommended_base_name?.split(" ")[0]}</span>
+                    {/* Expand toggle */}
+                    <div onClick={() => setSelected(isSelected ? null : d.decision_id)}
+                      style={{ padding: "3px 10px 4px", borderTop: "1px solid #0d1e2a", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
+                      <span style={{ fontSize: 7, color: "#5a9ab8", letterSpacing: 1 }}>{isSelected ? "▲ HIDE DETAIL" : "▼ SHOW REASONING"}</span>
+                      {d.estimated_cost_usd && <span style={{ fontSize: 7.5, color: "#facc15" }}>${(d.estimated_cost_usd/1000).toFixed(0)}K</span>}
                     </div>
 
-                    {/* Row 3: weapon + confidence */}
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontSize: 8, color: "#2a5a6a", flexShrink: 0 }}>
-                        {(d.recommended_weapon || "").replace(/_/g, " ")} · {d.recommended_asset_type}
-                      </span>
-                      <div style={{ flex: 1, height: 2, background: "#0a1820", borderRadius: 2 }}>
-                        <div style={{ width: `${d.confidence}%`, height: "100%", background: confColor(d.confidence), borderRadius: 2 }} />
-                      </div>
-                      <span style={{ fontSize: 9, color: confColor(d.confidence), minWidth: 26 }}>{d.confidence}%</span>
-                    </div>
-
-                    {/* Expanded detail */}
+                    {/* Expanded detail — progressive disclosure */}
                     {isSelected && (
-                      <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #0d1e2a" }}>
-                        {d.estimated_cost_usd && (
-                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, padding: "4px 8px", background: "#05101a", border: "1px solid #0d2030" }}>
-                            <span style={{ fontSize: 8, color: "#2a5a6a", letterSpacing: 1 }}>MISSION COST</span>
-                            <span style={{ fontSize: 10, color: "#facc15", fontWeight: "bold" }}>${d.estimated_cost_usd.toLocaleString()}</span>
-                          </div>
-                        )}
-                        {d.cost_rationale && <Section label="COST RATIONALE" color="#8a7040">{d.cost_rationale}</Section>}
-                        <Section label="REASONING" color="#8ab0c0">{d.reasoning}</Section>
+                      <div style={{ padding: "8px 10px 10px", borderTop: "1px solid #0d1e2a", background: "#0f2238" }}>
+                        {d.cost_rationale && <Section label="COST" color="#a07830">{d.cost_rationale}</Section>}
+                        <Section label="REASONING" color="#a8ccd8">{d.reasoning}</Section>
                         {d.alternatives_rejected?.length > 0 && (
                           <div style={{ marginBottom: 8 }}>
                             <Label>ALTERNATIVES REJECTED</Label>
                             {d.alternatives_rejected.map((alt, j) => (
-                              <div key={j} style={{ fontSize: 9, color: "#4a6a7a", marginBottom: 3, paddingLeft: 8, borderLeft: "2px solid #0d2030" }}>
-                                <span style={{ color: "#6a8a9a" }}>{alt.base}</span> — {alt.reason}
+                              <div key={j} style={{ fontSize: 8.5, color: "#4a6070", marginBottom: 3, paddingLeft: 8, borderLeft: "2px solid #0d2030" }}>
+                                <span style={{ color: "#8ab0c4" }}>{alt.base}</span> — {alt.reason}
                               </div>
                             ))}
                           </div>
                         )}
-                        {d.trade_offs && <Section label="TRADE-OFFS" color="#facc15">{d.trade_offs}</Section>}
-                        {d.civilian_note && <Section label={`CIVILIAN RISK: ${(d.civilian_risk||"").toUpperCase()}`} color="#facc15">{d.civilian_note}</Section>}
-                        <Section label="FUTURE RISK" color="#4ade80">{d.future_risk}</Section>
+                        {d.trade_offs && <Section label="TRADE-OFFS" color="#c0a040">{d.trade_offs}</Section>}
+                        {d.civilian_note && <Section label={`CIVILIAN ${(d.civilian_risk||"").toUpperCase()}`} color="#facc15">{d.civilian_note}</Section>}
+                        {d.future_risk && <Section label="FUTURE RISK" color="#4ade80">{d.future_risk}</Section>}
                       </div>
                     )}
                   </div>
@@ -653,15 +1315,8 @@ export default function App() {
             </div>
           )}
 
-          {/* ── HOLD queue ── */}
-          {tab === "hold" && (
-            <div style={{ flex: 1, overflowY: "auto" }}>
-              {pending.length === 0 && (
-                <div style={{ padding: "60px 0", textAlign: "center", color: "#1a3a4a", fontSize: 10, letterSpacing: 1 }}>
-                  NO PENDING DECISIONS
-                </div>
-              )}
-              {pending.map(p => {
+          {/* HOLD panel removed — pending decisions appear at top of FEED tab */}
+          {false && [].map(p => {
                 const d = p.decision;
                 const elapsed  = Math.floor((Date.now() / 1000) - p.created_at);
                 const totalEta = p.threat.eta || 600;
@@ -689,7 +1344,7 @@ export default function App() {
                         </div>
                         {/* ETA — the primary prioritisation signal */}
                         <div style={{ textAlign: "right" }}>
-                          <div style={{ fontSize: 7, color: "#2a5a6a", letterSpacing: 1, marginBottom: 1 }}>IMPACT IN</div>
+                          <div style={{ fontSize: 7, color: "#5aaac8", letterSpacing: 1, marginBottom: 1 }}>IMPACT IN</div>
                           <div style={{ fontSize: 22, fontWeight: "bold", color: etaColor, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
                             {formatETA(remaining)}
                           </div>
@@ -697,13 +1352,13 @@ export default function App() {
                       </div>
 
                       {/* ETA progress bar */}
-                      <div style={{ height: 2, background: "#0a1820", borderRadius: 2, marginBottom: 6 }}>
+                      <div style={{ height: 2, background: "#0d2238", borderRadius: 2, marginBottom: 6 }}>
                         <div style={{ width: `${pct}%`, height: "100%", background: etaColor, borderRadius: 2, transition: "width 1s linear" }} />
                       </div>
 
                       {/* Threat context: type · distance · speed → target */}
-                      <div style={{ fontSize: 9, color: "#7a9aaa" }}>
-                        <span style={{ color: "#a0c0cc" }}>{p.threat.type}</span>
+                      <div style={{ fontSize: 9, color: "#9abccc" }}>
+                        <span style={{ color: "#b8d4e0" }}>{p.threat.type}</span>
                         {p.threat.dist_km && <span style={{ color: "#3a6070" }}> · {p.threat.dist_km} km · {p.threat.speed} km/h</span>}
                         <span style={{ color: "#3a6070" }}> → </span>
                         <span style={{ color: "#facc15", fontWeight: "bold" }}>{p.threat.target_name}</span>
@@ -735,13 +1390,13 @@ export default function App() {
                       </div>
 
                       {/* Confidence bar */}
-                      <div style={{ height: 3, background: "#0a1820", borderRadius: 2, marginBottom: 8 }}>
+                      <div style={{ height: 3, background: "#0d2238", borderRadius: 2, marginBottom: 8 }}>
                         <div style={{ width: `${d.confidence}%`, height: "100%", background: confColor(d.confidence), borderRadius: 2 }} />
                       </div>
 
                       {/* Collapsible reasoning */}
                       <button onClick={() => toggleReasoning(p.decision_id)}
-                        style={{ background: "none", border: "none", color: "#2a5a6a", fontSize: 8, cursor: "pointer", padding: 0, letterSpacing: 1, fontFamily: "inherit" }}>
+                        style={{ background: "none", border: "none", color: "#5aaac8", fontSize: 8, cursor: "pointer", padding: 0, letterSpacing: 1, fontFamily: "inherit" }}>
                         {expandedReasoning.has(p.decision_id) ? "▲ HIDE REASONING" : "▼ SHOW REASONING"}
                       </button>
                       {expandedReasoning.has(p.decision_id) && (
@@ -751,7 +1406,7 @@ export default function App() {
                           {d.alternatives_rejected?.length > 0 && (
                             <div style={{ marginTop: 4 }}>
                               {d.alternatives_rejected.map((alt, j) => (
-                                <div key={j} style={{ color: "#3a5a6a", marginTop: 2 }}>
+                                <div key={j} style={{ color: "#6ab0cc", marginTop: 2 }}>
                                   <span style={{ color: "#5a7a8a" }}>{alt.base}</span>: {alt.reason}
                                 </div>
                               ))}
@@ -769,7 +1424,7 @@ export default function App() {
                         <select
                           value={overrideBase[p.decision_id] || ""}
                           onChange={e => setOverrideBase(o => ({ ...o, [p.decision_id]: e.target.value || undefined }))}
-                          style={{ width: "100%", background: "#05101a", border: "1px solid #0d2030", color: overrideBase[p.decision_id] ? "#3fc1ff" : "#2a4a5a", padding: "5px 8px", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>
+                          style={{ width: "100%", background: "#112538", border: "1px solid #0d2030", color: overrideBase[p.decision_id] ? "#3fc1ff" : "#5a9ab8", padding: "5px 8px", fontSize: 9, cursor: "pointer", fontFamily: "inherit" }}>
                           <option value="">AI choice: {d.recommended_base}</option>
                           {BASES.north.map(b => (
                             <option key={b.id} value={b.id}>{b.id} — {b.name}</option>
@@ -792,17 +1447,15 @@ export default function App() {
                   </div>
                 );
               })}
-            </div>
-          )}
 
           {/* Base status */}
           {tab === "state" && (
             <div style={{ flex: 1, overflowY: "auto", padding: 14 }}>
               {(northStatus.length > 0 ? northStatus : BASES.north.map(b => ({ ...b, available: [], deployed: [] }))).map(base => (
-                <div key={base.id} style={{ marginBottom: 14, padding: 10, border: "1px solid #0d1e2a", background: "#05101a" }}>
+                <div key={base.id} style={{ marginBottom: 14, padding: 10, border: "1px solid #0d1e2a", background: "#112538" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
                     <span style={{ fontSize: 9, fontWeight: "bold", color: "#3fc1ff", letterSpacing: 1 }}>{base.id}</span>
-                    <span style={{ fontSize: 8, color: "#2a5a6a" }}>
+                    <span style={{ fontSize: 8, color: "#5aaac8" }}>
                       <span style={{ color: "#4ade80" }}>{base.available.length} RDY</span>
                       {base.deployed?.length > 0 && <span style={{ color: "#facc15", marginLeft: 6 }}>{base.deployed.length} DEPLOYED</span>}
                     </span>
@@ -816,13 +1469,13 @@ export default function App() {
                   {base.available.map(a => (
                     <div key={a.id} style={{ marginBottom: 6 }}>
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                        <span style={{ fontSize: 8, color: "#4a6a7a" }}>{a.id} · {a.type}</span>
+                        <span style={{ fontSize: 8, color: "#6a9ab0" }}>{a.id} · {a.type}</span>
                         <span style={{ fontSize: 8, color: fuelColor(a.fuel_pct) }}>{a.fuel_pct}%</span>
                       </div>
-                      <div style={{ height: 3, background: "#0a1820", borderRadius: 2 }}>
+                      <div style={{ height: 3, background: "#0d2238", borderRadius: 2 }}>
                         <div style={{ width: `${a.fuel_pct}%`, height: "100%", background: fuelColor(a.fuel_pct), borderRadius: 2 }} />
                       </div>
-                      <div style={{ fontSize: 7, color: "#2a4a5a", marginTop: 1 }}>{a.range_km} km range · {a.weapons?.join(", ").replace(/_/g," ")}</div>
+                      <div style={{ fontSize: 7, color: "#5a9ab8", marginTop: 1 }}>{a.range_km} km range · {a.weapons?.join(", ").replace(/_/g," ")}</div>
                     </div>
                   ))}
 
@@ -852,7 +1505,7 @@ export default function App() {
                         <span style={{ fontSize: 7, color: "#1e4050", letterSpacing: 2 }}>FUEL STOCK</span>
                         <span style={{ fontSize: 8, color: fuelColor(base.fuel_pct) }}>{base.fuel_pct}%  ({(base.fuel_stock_liters||0).toLocaleString()}L)</span>
                       </div>
-                      <div style={{ height: 3, background: "#0a1820", borderRadius: 2 }}>
+                      <div style={{ height: 3, background: "#0d2238", borderRadius: 2 }}>
                         <div style={{ width: `${base.fuel_pct}%`, height: "100%", background: fuelColor(base.fuel_pct), borderRadius: 2 }} />
                       </div>
                     </div>
@@ -868,7 +1521,7 @@ export default function App() {
                   )}
 
                   {base.ground_ammo !== undefined && (
-                    <div style={{ fontSize: 8, color: "#2a4050", marginTop: 4, borderTop: "1px solid #0a1820", paddingTop: 4 }}>
+                    <div style={{ fontSize: 8, color: "#5a8aa0", marginTop: 4, borderTop: "1px solid #0a1820", paddingTop: 4 }}>
                       GND DEFENSE: {base.ground_ammo} rounds
                     </div>
                   )}
@@ -877,26 +1530,132 @@ export default function App() {
             </div>
           )}
 
-          {/* Stats */}
-          <div style={{ padding: "8px 14px", borderTop: "1px solid #0d1e2a", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            {[["THREATS", threats.length, "#f87171"], ["DECISIONS", decisions.length, "#3fc1ff"], ["CIVILIAN", civilians.length, "#aaaaaa"]].map(([label, val, color]) => (
-              <div key={label} style={{ textAlign: "center" }}>
-                <div style={{ fontSize: 8, color: "#1e3a4a", letterSpacing: 1 }}>{label}</div>
-                <div style={{ fontSize: 20, color, lineHeight: 1.2 }}>{val}</div>
+          {/* ── STATS tab ── */}
+          {tab === "stats" && (() => {
+            const total = interceptedCount + missedCount;
+            const rate  = total > 0 ? Math.round(interceptedCount / total * 100) : null;
+            const rateColor = rate === null ? "#6ab0cc" : rate >= 70 ? "#4ade80" : rate >= 40 ? "#facc15" : "#f87171";
+            const typeMap = {};
+            timeline.forEach(ev => {
+              if (!ev.threatType) return;
+              if (!typeMap[ev.threatType]) typeMap[ev.threatType] = { detected: 0, intercepted: 0, missed: 0 };
+              if (ev.type === "threat" || ev.type === "intercepted" || ev.type === "missed") typeMap[ev.threatType].detected++;
+              if (ev.type === "intercepted") typeMap[ev.threatType].intercepted++;
+              if (ev.type === "missed")      typeMap[ev.threatType].missed++;
+            });
+            return (
+              <div style={{ flex: 1, overflowY: "auto" }}>
+                <div style={{ padding: "16px 14px 12px", borderBottom: "1px solid #0a1820" }}>
+                  <div style={{ fontSize: 7, color: "#5aaac8", letterSpacing: 2, marginBottom: 10 }}>MISSION INTERCEPT RATE</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 10 }}>
+                    <div style={{ fontSize: 48, fontWeight: "bold", color: rateColor, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
+                      {rate !== null ? `${rate}%` : "—"}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: "#4ade80", marginBottom: 3 }}>✓ {interceptedCount} intercepted</div>
+                      <div style={{ fontSize: 10, color: "#f87171" }}>✗ {missedCount} reached target</div>
+                      <div style={{ fontSize: 9, color: "#6ab0cc", marginTop: 3 }}>{total} total threats</div>
+                    </div>
+                  </div>
+                  <div style={{ height: 8, background: "#0d2238", borderRadius: 4, overflow: "hidden" }}>
+                    {total > 0 && (
+                      <div style={{ display: "flex", height: "100%" }}>
+                        <div style={{ width:`${interceptedCount/total*100}%`, background:"#4ade80", transition:"width 0.5s" }} />
+                        <div style={{ width:`${missedCount/total*100}%`, background:"#f87171", transition:"width 0.5s" }} />
+                      </div>
+                    )}
+                  </div>
+                </div>
+                {Object.keys(typeMap).length > 0 && (
+                  <div style={{ padding: "12px 14px" }}>
+                    <div style={{ fontSize: 7, color: "#5aaac8", letterSpacing: 2, marginBottom: 10 }}>BY THREAT TYPE</div>
+                    {Object.entries(typeMap).map(([type, s]) => {
+                      const tr = s.detected > 0 ? Math.round(s.intercepted / s.detected * 100) : 0;
+                      const tc = tr >= 70 ? "#4ade80" : tr >= 40 ? "#facc15" : "#f87171";
+                      return (
+                        <div key={type} style={{ marginBottom: 10 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <svg width="11" height="11" viewBox="-12 -12 24 24">
+                                <ThreatIcon type={type} color="#9abccc" angle={0} />
+                              </svg>
+                              <span style={{ fontSize: 8.5, color: "#a8ccd8" }}>{type}</span>
+                            </div>
+                            <span style={{ fontSize: 8, color: tc, fontWeight: "bold" }}>{s.intercepted}/{s.detected} · {tr}%</span>
+                          </div>
+                          <div style={{ height: 4, background: "#0d2238", borderRadius: 2, overflow: "hidden" }}>
+                            <div style={{ width:`${tr}%`, height:"100%", background:tc, transition:"width 0.5s", borderRadius:2 }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {Object.keys(typeMap).length === 0 && (
+                  <div style={{ padding: "40px 0", textAlign: "center", color: "#4a7890", fontSize: 9, letterSpacing: 1 }}>NO DATA YET</div>
+                )}
               </div>
-            ))}
-            <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 8, color: "#1e3a4a", letterSpacing: 1 }}>SPENT</div>
-              <div style={{ fontSize: sessionCost >= 1_000_000 ? 13 : 16, color: sessionCost > 5_000_000 ? "#f87171" : "#facc15", lineHeight: 1.2, fontWeight: "bold" }}>
-                ${sessionCost >= 1_000_000 ? (sessionCost / 1_000_000).toFixed(1) + "M" : sessionCost >= 1000 ? (sessionCost / 1000).toFixed(0) + "K" : sessionCost}
-              </div>
+            );
+          })()}
+
+          {/* ── LOG tab ── */}
+          {tab === "log" && (
+            <div style={{ flex: 1, overflowY: "auto" }}>
+              {timeline.length === 0 && (
+                <div style={{ padding: "60px 0", textAlign: "center", color: "#4a7890", fontSize: 9, letterSpacing: 1 }}>NO EVENTS YET</div>
+              )}
+              {timeline.map(ev => {
+                const cfg = {
+                  intercepted: { icon: "✓", label: "INTERCEPT", bg: "#0c2416", border: "#1a4828", iconColor: "#4ade80", textColor: "#5ac870" },
+                  missed:      { icon: "✗", label: "MISS",      bg: "#280a0a", border: "#4a1818", iconColor: "#f87171", textColor: "#d06060" },
+                  wave:        { icon: "⚡", label: "WAVE",      bg: "#201a00", border: "#4a3c00", iconColor: "#facc15", textColor: "#d0a820" },
+                  threat:      { icon: "↑", label: "DETECT",    bg: "#102030", border: "#1e3850", iconColor: "#7ab8d0", textColor: "#7ab8d0" },
+                  hold:        { icon: "⏸", label: "HOLD",      bg: "#201800", border: "#4a3800", iconColor: "#facc15", textColor: "#c0a030" },
+                  approved:    { icon: "👤", label: "APPROVED",  bg: "#0a2012", border: "#144020", iconColor: "#4ade80", textColor: "#5ab870" },
+                  rejected:    { icon: "⛔", label: "REJECTED",  bg: "#200a0a", border: "#3a1010", iconColor: "#f87171", textColor: "#c06060" },
+                  emcon:       { icon: "◇",  label: "EMCON",     bg: "#201000", border: "#503800", iconColor: "#facc15", textColor: "#c09010" },
+                }[ev.type] || { icon: "·", label: ev.type.toUpperCase(), bg: "#102030", border: "#1e3850", iconColor: "#4a7890", textColor: "#4a7890" };
+
+                const ts = new Date(ev.time);
+                const timeStr = ts.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+                return (
+                  <div key={ev.id} style={{ display: "flex", borderBottom: "1px solid #0a1620" }}>
+                    {/* Color stripe */}
+                    <div style={{ width: 3, background: cfg.iconColor, flexShrink: 0, opacity: 0.6 }} />
+                    <div style={{ flex: 1, padding: "7px 10px", background: cfg.bg }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                          <span style={{ fontSize: 10, color: cfg.iconColor }}>{cfg.icon}</span>
+                          <span style={{ fontSize: 7, color: cfg.iconColor, letterSpacing: 1.5, fontWeight: "bold", background: cfg.border, padding: "1px 5px", borderRadius: 2 }}>
+                            {cfg.label}
+                          </span>
+                          {ev.threatType && (
+                            <svg width="10" height="10" viewBox="-12 -12 24 24" style={{ opacity: 0.7 }}>
+                              <ThreatIcon type={ev.threatType} color={cfg.iconColor} angle={0} />
+                            </svg>
+                          )}
+                        </div>
+                        <span style={{ fontSize: 8, color: "#5a9ab8", fontVariantNumeric: "tabular-nums", fontFamily: "monospace" }}>{timeStr}</span>
+                      </div>
+                      <div style={{ fontSize: 8.5, color: cfg.textColor, lineHeight: 1.5 }}>{ev.label}</div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
+          )}
+
+          {/* ── Bottom bar — minimal, info already in status strip ── */}
+          <div style={{ padding: "6px 12px", borderTop: "1px solid #0a1820", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#081c30" }}>
+            <span style={{ fontSize: 7.5, color: "#4a7898" }}>{decisions.length} decisions · {civilians.length} civilian acft</span>
+            <span style={{ fontSize: 7.5, color: "#4a7898" }}>{new Date().toLocaleTimeString("en-GB")}</span>
           </div>
 
           {/* Wave forecast panel */}
-          <div style={{ borderTop: "1px solid #0d1e2a", padding: "10px 14px", background: "#050d16" }}>
+          <div style={{ borderTop: "1px solid #0d1e2a", padding: "10px 14px", background: "#081c30" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-              <span style={{ fontSize: 8, color: "#2a5a6a", letterSpacing: 2 }}>WAVE FORECAST</span>
+              <span style={{ fontSize: 8, color: "#5aaac8", letterSpacing: 2 }}>WAVE FORECAST</span>
               {forecast?.risk_level && (
                 <span style={{ fontSize: 8, padding: "1px 6px", background: riskColor(forecast.risk_level) + "22", color: riskColor(forecast.risk_level), border: `1px solid ${riskColor(forecast.risk_level)}44`, letterSpacing: 1 }}>
                   {forecast.risk_level.toUpperCase()}
@@ -905,13 +1664,13 @@ export default function App() {
             </div>
 
             {waveLog.length === 0 ? (
-              <div style={{ fontSize: 9, color: "#1a3a4a", letterSpacing: 1 }}>AWAITING FIRST WAVE DATA</div>
+              <div style={{ fontSize: 9, color: "#4a7890", letterSpacing: 1 }}>AWAITING FIRST WAVE DATA</div>
             ) : (
               <>
                 {/* Client-side heuristics */}
                 <div style={{ display: "flex", gap: 12, marginBottom: 6 }}>
                   <div>
-                    <div style={{ fontSize: 7, color: "#1e3a4a", letterSpacing: 1 }}>WAVES</div>
+                    <div style={{ fontSize: 7, color: "#4a7898", letterSpacing: 1 }}>WAVES</div>
                     <div style={{ fontSize: 16, color: "#facc15", lineHeight: 1.2 }}>{waveLog.length}</div>
                   </div>
                   {waveLog.length >= 2 && (() => {
@@ -924,11 +1683,11 @@ export default function App() {
                     return (
                       <>
                         <div>
-                          <div style={{ fontSize: 7, color: "#1e3a4a", letterSpacing: 1 }}>AVG INTERVAL</div>
+                          <div style={{ fontSize: 7, color: "#4a7898", letterSpacing: 1 }}>AVG INTERVAL</div>
                           <div style={{ fontSize: 16, color: "#facc15", lineHeight: 1.2 }}>{avg.toFixed(1)}m</div>
                         </div>
                         <div>
-                          <div style={{ fontSize: 7, color: "#1e3a4a", letterSpacing: 1 }}>NEXT WAVE ~</div>
+                          <div style={{ fontSize: 7, color: "#4a7898", letterSpacing: 1 }}>NEXT WAVE ~</div>
                           <div style={{ fontSize: 16, color: nextIn < 1 ? "#f87171" : "#facc15", lineHeight: 1.2, fontWeight: "bold" }}>
                             {nextIn < 0.5 ? "NOW" : `${nextIn.toFixed(1)}m`}
                           </div>
@@ -942,14 +1701,14 @@ export default function App() {
                 {forecast ? (
                   <>
                     {forecast.predicted_targets?.length > 0 && (
-                      <div style={{ fontSize: 9, color: "#8ab0c0", marginBottom: 4 }}>
-                        <span style={{ color: "#2a5a6a", fontSize: 8 }}>PREDICTED TARGET  </span>
+                      <div style={{ fontSize: 9, color: "#a8ccd8", marginBottom: 4 }}>
+                        <span style={{ color: "#5aaac8", fontSize: 8 }}>PREDICTED TARGET  </span>
                         {forecast.predicted_targets.join(", ")}
                       </div>
                     )}
                     {forecast.threat_types_expected?.length > 0 && (
-                      <div style={{ fontSize: 9, color: "#8ab0c0", marginBottom: 4 }}>
-                        <span style={{ color: "#2a5a6a", fontSize: 8 }}>EXPECTED TYPES  </span>
+                      <div style={{ fontSize: 9, color: "#a8ccd8", marginBottom: 4 }}>
+                        <span style={{ color: "#5aaac8", fontSize: 8 }}>EXPECTED TYPES  </span>
                         {forecast.threat_types_expected.join(", ")}
                       </div>
                     )}
@@ -959,11 +1718,11 @@ export default function App() {
                       </div>
                     )}
                     {forecast.reasoning && (
-                      <div style={{ fontSize: 8, color: "#3a5a6a", lineHeight: 1.5 }}>{forecast.reasoning}</div>
+                      <div style={{ fontSize: 8, color: "#6ab0cc", lineHeight: 1.5 }}>{forecast.reasoning}</div>
                     )}
                   </>
                 ) : (
-                  <div style={{ fontSize: 8, color: "#1a3a4a" }}>Fetching AI forecast...</div>
+                  <div style={{ fontSize: 8, color: "#4a7890" }}>Fetching AI forecast...</div>
                 )}
               </>
             )}
@@ -975,7 +1734,7 @@ export default function App() {
 }
 
 function Label({ children }) {
-  return <div style={{ fontSize: 8, color: "#2a5a6a", letterSpacing: 1, marginBottom: 4 }}>{children}</div>;
+  return <div style={{ fontSize: 8.5, color: "#7ac8e0", letterSpacing: 1.5, marginBottom: 5, fontWeight: "bold" }}>{children}</div>;
 }
 
 function Section({ label, color, children }) {
