@@ -41,7 +41,12 @@ const SHIPS = [
   { id: "SNS-2", name: "SNS Resolute",  x_km: 700,  y_km: 670, ...toSVG(700,  670) },
   { id: "SNS-3", name: "SNS Vigilant",  x_km: 1250, y_km: 640, ...toSVG(1250, 640) },
 ];
-const SHIP_SAM_RANGE_SVG = 220 * SCALE_Y;  // 220km in SVG pixels
+const SHIP_SAM_RANGE_SVG   = 350 * SCALE_Y;  // 350km max SAM range
+const SHIP_RADAR_RANGE_SVG = 220 * SCALE_Y;  // 220km onboard fire-control radar — auto-engages on entry
+const GROUND_DEF_RANGE_SVG = 300 * SCALE_Y;  // 300km ground SAM range
+const CIWS_RANGE_SVG        = 15  * SCALE_Y;  // 15km CIWS last-resort auto-fire
+const SHIP_HIT_RADIUS       = 18;             // SVG px — threat this close triggers hit
+const NORTH_CITY_IDS        = new Set(["ARK", "VLB", "NDV"]); // only these trigger city-hit path
 let threatCounter = 1;
 
 // Radar stations — on the three north-passage islands in the Boreal Passage
@@ -179,11 +184,14 @@ export default function App() {
   const warModeRef  = useRef(false);
   const [loading,          setLoading]          = useState(false);
   const [apiStatus,        setApiStatus]        = useState("checking");
+  const [aiStatus,         setAiStatus]         = useState("unknown"); // "online"|"offline"|"unknown"
   const [tab,              setTab]              = useState("feed");
   const [showRanges,       setShowRanges]       = useState(false);
   const [aircraftStatus,   setAircraftStatus]   = useState([]);
-  const [shipStatus,       setShipStatus]       = useState(SHIPS.map(s => ({ ...s, sam_count: 10 })));
+  const [shipStatus,       setShipStatus]       = useState(SHIPS.map(s => ({ ...s, sam_count: 10, ciws_rounds: 200 })));
+  const shipStatusRef      = useRef(SHIPS.map(s => ({ ...s, sam_count: 10, ciws_rounds: 200 })));
   const [threatenedTargets,setThreatenedTargets]= useState(new Set());
+  const [hitCities,        setHitCities]        = useState({});  // cityId → hit timestamp
   const [overrideBase,       setOverrideBase]       = useState({});
   const [waveLog,            setWaveLog]            = useState([]);
   const [forecast,           setForecast]           = useState(null);
@@ -202,6 +210,10 @@ export default function App() {
   const threatsRef   = useRef([]);    // always-current snapshot for interceptor collision checks
   const decidedThreatsRef  = useRef(new Set());   // tracks which threats have had callDecide fired
   const callDecideFnRef    = useRef(null);         // always-current callDecide (avoids stale closure in loop)
+  const autoEngagedRef     = useRef(new Set());    // threats auto-engaged by ground/CIWS (no Gemini needed)
+  const pendingThreatIds   = useRef(new Set());    // threat IDs currently awaiting human approval — no auto-fire
+  const cityHitProcessed   = useRef(new Set());    // threat IDs whose city-hit explosion has been triggered
+  const shipHitProcessed   = useRef(new Set());    // threat IDs that have hit a ship
   const [radarsActive,     setRadarsActive]     = useState(true);
   const radarsActiveRef    = useRef(true);
   const spyInPassageRef    = useRef(false);        // true when a spy aircraft is in the radar zone
@@ -281,7 +293,18 @@ export default function App() {
       fetch(`${API}/state/aircraft`).then(r => r.json())
         .then(d => { if (d.bases) setAircraftStatus(d.bases); }).catch(() => {});
       fetch(`${API}/state/summary`).then(r => r.json())
-        .then(d => { if (d.ships) setShipStatus(d.ships); }).catch(() => {});
+        .then(d => {
+          if (d.ships) {
+            // Backend returns x_km/y_km — add SVG pixel coords before storing
+            const ships = d.ships.map(s => ({
+              ...s,
+              x: s.x_km * SCALE_X,
+              y: s.y_km * SCALE_Y,
+            }));
+            setShipStatus(ships);
+            shipStatusRef.current = ships;
+          }
+        }).catch(() => {});
     fetch_();
     const iv = setInterval(fetch_, 5000);
     return () => clearInterval(iv);
@@ -299,28 +322,19 @@ export default function App() {
   useEffect(() => {
     const fetch_ = () =>
       fetch(`${API}/pending`).then(r => r.json())
-        .then(d => { if (d.pending) setPending(d.pending); }).catch(() => {});
+        .then(d => {
+          if (d.pending) {
+            setPending(d.pending);
+            // Keep ref in sync so animation loop can check without stale closure
+            pendingThreatIds.current = new Set(d.pending.map(p => p.threat?.id).filter(Boolean));
+          }
+        }).catch(() => {});
     fetch_();
     const iv = setInterval(fetch_, 2000);
     return () => clearInterval(iv);
   }, []);
 
-  // Auto-execute HOLD items when ETA window closes
-  useEffect(() => {
-    if (pending.length === 0) return;
-    const iv = setInterval(() => {
-      const now = Date.now() / 1000;
-      pending.forEach(p => {
-        const elapsed  = now - p.created_at;
-        const remaining = (p.threat.eta || 600) - elapsed;
-        if (remaining < 90 && remaining > 0) {
-          // Window closing — auto-approve with AI recommendation
-          handleApprove(p.decision_id);
-        }
-      });
-    }, 2000);
-    return () => clearInterval(iv);
-  }, [pending]);
+  // No auto-approve — HOLD items stay until the human explicitly approves or rejects
 
   // Fetch wave forecast whenever waveLog changes (debounced to 30s minimum)
   useEffect(() => {
@@ -362,36 +376,26 @@ export default function App() {
       // Spy flights: auto-spawn during wartime, every ~2700 frames (~45s), only if none active
       if (warModeRef.current && t % 2700 === 0 && !spyInPassageRef.current) spawnSpyFlight();
 
-      setExplosions(prev => prev.map(e => ({ ...e, age: e.age + 1 })).filter(e => e.age < 55));
+      setExplosions(prev => prev.map(e => ({ ...e, age: e.age + 1 })).filter(e => e.cityHit ? e.age < 90 : e.age < 55));
 
       setThreats(prev => {
-        // Detect threats that reached their target (exit top of SVG, heading north)
-        const reached = prev.filter(th => !th.intercepted && th.y < -30 && th.vy < 0);
-        if (reached.length > 0) {
-          setMissedCount(c => c + reached.length);
-          reached.forEach(th => {
-            setTimeline(t => [{
-              id: `miss-${th.id}-${Date.now()}`, type: "missed", time: Date.now(),
-              label: `${th.type} reached ${th.target_name}`,
-              threatType: th.type,
-            }, ...t.slice(0, 99)]);
-          });
-        }
-
         const next = prev.map(th => {
           if (th.intercepted) {
-            // Tumble and fall under simulated gravity + drag
-            return {
-              ...th,
-              x: th.x + th.vx, y: th.y + th.vy,
-              vx: th.vx * 0.91,
-              vy: th.vy + 0.18,
-              age: th.age + 1,
-            };
+            return { ...th, x: th.x + th.vx, y: th.y + th.vy, vx: th.vx * 0.91, vy: th.vy + 0.18, age: th.age + 1 };
           }
-          return { ...th, x: th.x + th.vx, y: th.y + th.vy, age: th.age + 1 };
+          if (th.hit) {
+            return { ...th, hit_age: (th.hit_age || 0) + 1 };
+          }
+          const moved = { ...th, x: th.x + th.vx, y: th.y + th.vy, age: th.age + 1 };
+          // City impact — only for north city targets, not ships
+          if (NORTH_CITY_IDS.has(th.target_id) &&
+              Math.hypot(moved.x - th.target_x, moved.y - th.target_y) < 16) {
+            return { ...moved, hit: true, hit_age: 0, x: th.target_x, y: th.target_y, vx: 0, vy: 0 };
+          }
+          return moved;
         }).filter(th => {
           if (th.intercepted) return (th.age - th.intercepted_at) < 90;
+          if (th.hit)         return (th.hit_age || 0) < 80;
           return th.x > -40 && th.x < 1040 && th.y > -40 && th.y < 830;
         });
 
@@ -454,6 +458,152 @@ export default function App() {
               setTimeline(tl => [{
                 id: `th-${th.id}-${Date.now()}`, type: "threat", time: Date.now(),
                 label: `RADAR CONTACT: ${th.type} → ${th.target_name}`, threatType: th.type,
+              }, ...tl.slice(0, 99)]);
+            });
+          }, 0);
+        }
+      }
+
+      // ── Auto-fire: ground SAM and ship CIWS — collect ALL new interceptors first,
+      //    then add in ONE setInterceptors call (batching avoids React overwriting earlier ones)
+      if (warModeRef.current) {
+        const autoNew = [];
+        threatsRef.current.forEach(th => {
+          // Skip if not active, already handled, or radar already triggered a decision for this threat.
+          // decidedThreatsRef is populated synchronously at detection — blocks auto-fire immediately,
+          // before callDecide's HTTP response arrives (which can take 200ms+).
+          if (!th.detected || th.intercepted || th.hit || autoEngagedRef.current.has(th.id)) return;
+          if (decidedThreatsRef.current.has(th.id)) return; // a decision (AI or human) is in progress
+
+          // Ground defense — nearest north base in range
+          for (const base of BASES.north) {
+            const dist = Math.hypot(th.x - base.x, th.y - base.y);
+            if (dist <= GROUND_DEF_RANGE_SVG) {
+              autoEngagedRef.current.add(th.id);
+              const dx = th.x - base.x, dy = th.y - base.y, len = Math.hypot(dx, dy) || 1;
+              autoNew.push({
+                id: `gnd-${base.id}-${th.id}-${Date.now()}`,
+                assetType: "ground_defense", weapon: "ground_cannon",
+                x: base.x, y: base.y, vx: (dx/len)*1.6, vy: (dy/len)*1.6,
+                targetId: th.id, baseId: base.id, age: 0,
+              });
+              break;
+            }
+          }
+          if (autoEngagedRef.current.has(th.id)) return;
+
+          // Ship SAM — fire-control radar: auto-engage any threat entering ship radar bubble
+          for (const ship of SHIPS) {
+            const st = shipStatusRef.current.find(s => s.id === ship.id);
+            if (!st || (st.sam_count ?? 0) <= 0) continue;
+            const dist = Math.hypot(th.x - ship.x, th.y - ship.y);
+            if (dist <= SHIP_RADAR_RANGE_SVG) {
+              autoEngagedRef.current.add(th.id);
+              const dx = th.x - ship.x, dy = th.y - ship.y, len = Math.hypot(dx, dy) || 1;
+              autoNew.push({
+                id: `sam-${ship.id}-${th.id}-${Date.now()}`,
+                assetType: "ship_sam", weapon: "ship_sam",
+                x: ship.x, y: ship.y, vx: (dx/len)*2.0, vy: (dy/len)*2.0,
+                targetId: th.id, baseId: ship.id, age: 0,
+              });
+              // Decrement locally — backend syncs on next poll
+              const updated = shipStatusRef.current.map(s =>
+                s.id === ship.id ? { ...s, sam_count: Math.max(0, s.sam_count - 1) } : s
+              );
+              shipStatusRef.current = updated;
+              setShipStatus(updated);
+              break;
+            }
+          }
+          if (autoEngagedRef.current.has(th.id)) return;
+
+          // Ship CIWS — last resort at very close range
+          for (const ship of SHIPS) {
+            const st = shipStatusRef.current.find(s => s.id === ship.id);
+            if (!st || (st.ciws_rounds ?? 200) <= 0) continue;
+            const dist = Math.hypot(th.x - ship.x, th.y - ship.y);
+            if (dist <= CIWS_RANGE_SVG) {
+              autoEngagedRef.current.add(th.id);
+              const dx = th.x - ship.x, dy = th.y - ship.y, len = Math.hypot(dx, dy) || 1;
+              autoNew.push({
+                id: `ciws-${ship.id}-${th.id}-${Date.now()}`,
+                assetType: "ship_ciws", weapon: "ship_ciws",
+                x: ship.x, y: ship.y, vx: (dx/len)*2.8, vy: (dy/len)*2.8,
+                targetId: th.id, baseId: ship.id, age: 0,
+              });
+              break;
+            }
+          }
+        });
+        // Single batched update — all new auto-fire interceptors in one call
+        if (autoNew.length > 0) {
+          setInterceptors(p => [...p, ...autoNew].slice(-20));
+        }
+      }
+
+      // ── City impact detection (outside setThreats to keep updater pure) ──────
+      {
+        const justHit = [];
+        threatsRef.current.forEach(th => {
+          if (th.hit && !cityHitProcessed.current.has(th.id) && NORTH_CITY_IDS.has(th.target_id)) {
+            cityHitProcessed.current.add(th.id);
+            justHit.push(th);
+          }
+        });
+        if (justHit.length > 0) {
+          setTimeout(() => {
+            justHit.forEach(th => {
+              setMissedCount(c => c + 1);
+              // Large city-strike explosion
+              setExplosions(p => [...p.slice(-20),
+                { id: `city-${th.id}-${Date.now()}`, x: th.target_x, y: th.target_y, age: 0, cityHit: true },
+              ]);
+              setHitCities(h => ({ ...h, [th.target_id]: Date.now() }));
+              setTimeline(tl => [{
+                id: `hit-${th.id}-${Date.now()}`, type: "missed", time: Date.now(),
+                label: `${th.type} STRUCK ${th.target_name}`, threatType: th.type,
+              }, ...tl.slice(0, 99)]);
+            });
+          }, 0);
+        }
+      }
+
+      // ── Ship hit detection ────────────────────────────────────────────────────
+      {
+        const shipHits = []; // { shipId, x, y }
+        threatsRef.current.forEach(th => {
+          // Skip: already intercepted, already processed as ship/city hit, or targeting a north city
+          if (th.intercepted || shipHitProcessed.current.has(th.id) || NORTH_CITY_IDS.has(th.target_id)) return;
+          for (const ship of SHIPS) {
+            if (Math.hypot(th.x - ship.x, th.y - ship.y) < SHIP_HIT_RADIUS) {
+              shipHitProcessed.current.add(th.id);
+              cityHitProcessed.current.add(th.id); // prevent city-impact path from also firing
+              shipHits.push({ shipId: ship.id, threatId: th.id, x: ship.x, y: ship.y, type: th.type });
+              break;
+            }
+          }
+        });
+        if (shipHits.length > 0) {
+          // Mark threats as hit at ship position
+          const hitIds = new Set(shipHits.map(h => h.threatId));
+          setThreats(prev => prev.map(th =>
+            hitIds.has(th.id) ? { ...th, hit: true, hit_age: 0, x: th.x, y: th.y, vx: 0, vy: 0 } : th
+          ));
+          setTimeout(() => {
+            shipHits.forEach(h => {
+              // Damage ship — decrement SAMs
+              setShipStatus(prev => prev.map(s =>
+                s.id === h.shipId
+                  ? { ...s, sam_count: Math.max(0, (s.sam_count || 0) - 4), ciws_rounds: Math.max(0, (s.ciws_rounds ?? 200) - 80) }
+                  : s
+              ));
+              setExplosions(p => [...p.slice(-20),
+                { id: `ship-hit-${h.threatId}-${Date.now()}`, x: h.x, y: h.y, age: 0, cityHit: true },
+              ]);
+              setMissedCount(c => c + 1);
+              setTimeline(tl => [{
+                id: `shiphit-${h.threatId}-${Date.now()}`, type: "missed", time: Date.now(),
+                label: `${h.type} STRUCK ${h.shipId} — ship damaged!`, threatType: h.type,
               }, ...tl.slice(0, 99)]);
             });
           }, 0);
@@ -534,7 +684,11 @@ export default function App() {
         spawnInterceptor({ ...d, recommended_base: override || d.recommended_base, threat_id: item.threat.id }, item.threat);
         setDecisions(p => [d, ...p.slice(0, 19)]);
       }
-      setPending(p => p.filter(x => x.decision_id !== decisionId));
+      setPending(p => {
+        const updated = p.filter(x => x.decision_id !== decisionId);
+        pendingThreatIds.current = new Set(updated.map(x => x.threat?.id).filter(Boolean));
+        return updated;
+      });
       setOverrideBase(o => { const n = { ...o }; delete n[decisionId]; return n; });
     } catch (e) { console.error(e); }
   };
@@ -542,7 +696,11 @@ export default function App() {
   const handleReject = async (decisionId) => {
     try {
       await fetch(`${API}/reject/${decisionId}`, { method: "POST" });
-      setPending(p => p.filter(x => x.decision_id !== decisionId));
+      setPending(p => {
+        const updated = p.filter(x => x.decision_id !== decisionId);
+        pendingThreatIds.current = new Set(updated.map(x => x.threat?.id).filter(Boolean));
+        return updated;
+      });
     } catch (e) { console.error(e); }
   };
 
@@ -554,8 +712,12 @@ export default function App() {
         body: JSON.stringify(threat),
       });
       const d = await res.json();
+      // Track whether Gemini is actually responding (fallback flag means AI is down)
+      setAiStatus(d.fallback ? "offline" : "online");
       if (d.status === "pending_approval") {
-        setTab("feed");  // HOLD cards appear at the TOP of the feed — keep operator on feed tab
+        // Block auto-fire immediately — don't wait for next 2s poll cycle
+        pendingThreatIds.current.add(threat.id);
+        setTab("feed");
       } else {
         const base = ALL_BASES.find(b => b.id === d.recommended_base);
         if (base) setIntercepts(p => [...p.slice(-12), { id: d.decision_id, x1: base.x, y1: base.y, x2: threat.x, y2: threat.y, age: 0 }]);
@@ -574,7 +736,7 @@ export default function App() {
         threat_id: threat.id, threat_type: threat.type,
         recommended_base: base.id, recommended_base_name: base.name,
         recommended_asset_type: "fighter", recommended_weapon: "long_range_missile",
-        confidence: 62 + Math.floor(Math.random() * 20),
+        confidence: 38 + Math.floor(Math.random() * 28),  // 38–65%: ~40% go to HOLD
         reasoning: `Offline fallback: ${base.name} selected as nearest base (${Math.round(sorted[0].dist)} SVG units).`,
         alternatives_rejected: [], trade_offs: "No AI coverage analysis — operating offline.",
         civilian_risk: threat.civilian_nearby ? "medium" : "none", civilian_note: "",
@@ -626,8 +788,20 @@ export default function App() {
       ALL_TYPES[Math.floor(Math.random() * ALL_TYPES.length)]
     );
 
+    // Occasionally retarget some threats toward ships (naval interdiction)
+    // ~20% chance per threat after wave 2, ships add a layer of tactical complexity
+    const activeShips = shipStatus.filter(s => s.sam_count > 0);
+    const finalTargets = targetPool.map(t => {
+      if (activeShips.length > 0 && waveLog.length >= 1 && Math.random() < 0.20) {
+        const ship = activeShips[Math.floor(Math.random() * activeShips.length)];
+        // Return a ship-as-target object compatible with spawnTowardTarget
+        return { id: ship.id, name: ship.name, x: ship.x, y: ship.y, x_km: ship.x_km, y_km: ship.y_km };
+      }
+      return t;
+    });
+
     // Spawn positions spread across full south border
-    const wave = targetPool.map((target, i) => {
+    const wave = finalTargets.map((target, i) => {
       const spawnX = 30 + Math.random() * 940;
       const spawnY = 660 + Math.random() * 60;
       return spawnTowardTarget(spawnX, spawnY, target, waveTypes[i]);
@@ -694,6 +868,9 @@ export default function App() {
           <span style={{ fontSize: 10, letterSpacing: 3, color: "#6ab4d8", fontWeight: "bold" }}>BOREAL PASSAGE AIR DEFENSE COMMAND</span>
           <span style={{ fontSize: 9, padding: "2px 7px", background: apiStatus === "online" ? "#0d3020" : "#301010", color: apiStatus === "online" ? "#4ade80" : "#f87171", border: `1px solid ${apiStatus === "online" ? "#4ade80" : "#f87171"}44`, borderRadius: 2, letterSpacing: 1 }}>
             API {apiStatus.toUpperCase()}
+          </span>
+          <span style={{ fontSize: 9, padding: "2px 7px", background: aiStatus === "online" ? "#0d3020" : aiStatus === "offline" ? "#2a1800" : "#101830", color: aiStatus === "online" ? "#4ade80" : aiStatus === "offline" ? "#facc15" : "#5a8ab0", border: `1px solid ${aiStatus === "online" ? "#4ade8044" : aiStatus === "offline" ? "#facc1566" : "#1e3a5644"}`, borderRadius: 2, letterSpacing: 1 }}>
+            AI {aiStatus === "online" ? "ONLINE" : aiStatus === "offline" ? "⚠ OFFLINE — FALLBACK" : "…"}
           </span>
           <span style={{ fontSize: 9, padding: "2px 8px", background: warMode ? "#2a0808" : "#0a1e12", color: warMode ? "#f87171" : "#4ade80", border: `1px solid ${warMode ? "#f87171" : "#4ade80"}44`, borderRadius: 2, letterSpacing: 1 }}>
             {warMode ? "⚠ AIRSPACE CLOSED" : "✓ AIRSPACE OPEN"}
@@ -845,16 +1022,31 @@ export default function App() {
               const sz = t.type === "capital" ? 18 : 13;
               const cx = t.x, cy = t.y;
               const threatened = threatenedTargets.has(t.id);
+              const hitTs = hitCities[t.id];
+              const isHit = hitTs && (Date.now() - hitTs) < 8000;  // 8s damage flash
               const targetDim = dim ? 0.25 : 1;
               return (
                 <g key={t.id} opacity={targetDim} style={{ transition: "opacity 0.25s" }}>
-                  {threatened && <circle cx={cx} cy={cy} r={sz * 1.9} fill="none" stroke="#f87171" strokeWidth="1" strokeDasharray="3 3" opacity="0.65" />}
+                  {/* Threat warning ring */}
+                  {threatened && !isHit && <circle cx={cx} cy={cy} r={sz * 1.9} fill="none" stroke="#f87171" strokeWidth="1" strokeDasharray="3 3" opacity="0.65" />}
+                  {/* City-hit damage ring — red pulsing */}
+                  {isHit && (
+                    <circle cx={cx} cy={cy} r={sz * 2.8} fill="none" stroke="#f87171" strokeWidth="2" opacity="0.8">
+                      <animate attributeName="r" values={`${sz*2};${sz*4};${sz*2}`} dur="0.8s" repeatCount="indefinite" />
+                      <animate attributeName="opacity" values="0.8;0.1;0.8" dur="0.8s" repeatCount="indefinite" />
+                    </circle>
+                  )}
                   <rect x={cx - sz/2} y={cy - sz/2} width={sz} height={sz}
-                    fill={t.type === "capital" ? "#ffcc00" : "#dde"}
-                    stroke={threatened ? "#f87171" : "#111"}
-                    strokeWidth={threatened ? 2 : (t.type === "capital" ? 1.8 : 1.2)} rx="2" />
-                  <text x={cx} y={cy + sz/2 + 9} fill={t.type === "capital" ? "rgba(255,204,0,0.8)" : "rgba(230,230,255,0.5)"} fontSize="6.5" textAnchor="middle" letterSpacing="0.3">
-                    {t.name.toUpperCase()}
+                    fill={isHit ? "#f87171" : t.type === "capital" ? "#ffcc00" : "#dde"}
+                    stroke={isHit ? "#ff0000" : threatened ? "#f87171" : "#111"}
+                    strokeWidth={isHit ? 3 : threatened ? 2 : (t.type === "capital" ? 1.8 : 1.2)} rx="2">
+                    {isHit && <animate attributeName="fill" values="#f87171;#ff0000;#f87171" dur="0.5s" repeatCount="indefinite" />}
+                  </rect>
+                  {isHit && <text x={cx} y={cy + 3} fill="#fff" fontSize="8" textAnchor="middle" fontWeight="bold">✕</text>}
+                  <text x={cx} y={cy + sz/2 + 9}
+                    fill={isHit ? "#f87171" : t.type === "capital" ? "rgba(255,204,0,0.8)" : "rgba(230,230,255,0.5)"}
+                    fontSize="6.5" textAnchor="middle" letterSpacing="0.3" fontWeight={isHit ? "bold" : "normal"}>
+                    {isHit ? `${t.name.toUpperCase()} HIT` : t.name.toUpperCase()}
                   </text>
                 </g>
               );
@@ -890,12 +1082,33 @@ export default function App() {
                       <animate attributeName="opacity" values="0.5;0.1;0.5" dur="1.4s" repeatCount="indefinite" />
                     </circle>
                   )}
+                  {/* Ground SAM engagement ring */}
+                  <circle cx={b.x} cy={b.y} r={GROUND_DEF_RANGE_SVG} fill="none"
+                    stroke="#facc15" strokeWidth={showRanges ? 0.7 : 0.3}
+                    strokeDasharray="4 6" opacity={showRanges ? 0.2 : 0.06} />
                   <circle cx={b.x} cy={b.y} r="26" fill="none" stroke={col} strokeWidth={isHl ? 1.2 : 0.5} strokeDasharray="4 3" opacity={isHl ? 0.7 : 0.35} />
                   <polygon points={`${b.x},${b.y-11} ${b.x-9},${b.y+6} ${b.x+9},${b.y+6}`} fill={col} stroke="#000" strokeWidth="1" />
                   <text x={b.x} y={b.y+22} fill={col} fontSize="7" textAnchor="middle" opacity="0.85">{b.name}</text>
                   {avail !== null && (
                     <text x={b.x+13} y={b.y-7} fill={col} fontSize="8" textAnchor="middle" fontWeight="bold">{avail}</text>
                   )}
+                  {/* Ground defense SAM battery icon — south side of base */}
+                  {(() => {
+                    const gndAmmo = st?.ground_ammo ?? 8;
+                    const gcol = gndAmmo > 3 ? "#facc15" : gndAmmo > 0 ? "#f97316" : "#f87171";
+                    return (
+                      <g opacity={0.85}>
+                        {/* SAM launcher arms */}
+                        <line x1={b.x - 8} y1={b.y + 8} x2={b.x - 8} y2={b.y + 14} stroke={gcol} strokeWidth="1.5" />
+                        <line x1={b.x - 8} y1={b.y + 11} x2={b.x - 3} y2={b.y + 7} stroke={gcol} strokeWidth="1" />
+                        <line x1={b.x + 8} y1={b.y + 8} x2={b.x + 8} y2={b.y + 14} stroke={gcol} strokeWidth="1.5" />
+                        <line x1={b.x + 8} y1={b.y + 11} x2={b.x + 3} y2={b.y + 7} stroke={gcol} strokeWidth="1" />
+                        <text x={b.x} y={b.y + 32} fill={gcol} fontSize="5.5" textAnchor="middle" letterSpacing="0.5">
+                          GND ×{gndAmmo}
+                        </text>
+                      </g>
+                    );
+                  })()}
                 </g>
               );
             })}
@@ -915,27 +1128,52 @@ export default function App() {
               const col = depleted ? "#f87171" : "#38bdf8";
               return (
                 <g key={ship.id} opacity={dim ? 0.15 : 1}>
-                  {/* SAM range ring — only when showRanges is on */}
+                  {/* Max SAM range — outer ring, only when showRanges */}
                   {showRanges && (
                     <circle cx={ship.x} cy={ship.y} r={SHIP_SAM_RANGE_SVG} fill="none"
-                      stroke={col} strokeWidth="0.5" strokeDasharray="5 4" opacity="0.18" />
+                      stroke={col} strokeWidth="0.5" strokeDasharray="8 6" opacity="0.12" />
                   )}
-                  {/* Ship hull — flat rectangle */}
-                  <rect x={ship.x - 10} y={ship.y - 4} width="20" height="8"
-                    fill={col} fillOpacity="0.18" stroke={col} strokeWidth="1" rx="2" />
+                  {/* Fire-control radar ring — always visible, pulsing */}
+                  <circle cx={ship.x} cy={ship.y} r={SHIP_RADAR_RANGE_SVG} fill="none"
+                    stroke={col} strokeWidth="0.7" strokeDasharray="5 4"
+                    opacity={depleted ? 0.05 : 0.18}>
+                    <animate attributeName="opacity" values="0.12;0.25;0.12" dur="3s" repeatCount="indefinite" />
+                  </circle>
+                  {/* Rotating radar sweep — fire-control radar */}
+                  {!depleted && (
+                    <line x1={ship.x} y1={ship.y} x2={ship.x} y2={ship.y - SHIP_RADAR_RANGE_SVG}
+                      stroke={col} strokeWidth="1" opacity="0.25" strokeLinecap="round">
+                      <animateTransform attributeName="transform" type="rotate"
+                        from={`0 ${ship.x} ${ship.y}`} to={`360 ${ship.x} ${ship.y}`}
+                        dur="4s" repeatCount="indefinite" />
+                    </line>
+                  )}
+                  {/* Ship hull — proper vessel silhouette */}
+                  <polygon
+                    points={`${ship.x+16},${ship.y+3} ${ship.x+18},${ship.y} ${ship.x+16},${ship.y-3} ${ship.x-14},${ship.y-3} ${ship.x-18},${ship.y} ${ship.x-14},${ship.y+3}`}
+                    fill={col} fillOpacity="0.15" stroke={col} strokeWidth="1.2" />
+                  {/* Bridge / superstructure */}
+                  <rect x={ship.x - 4} y={ship.y - 7} width="10" height="4"
+                    fill={col} fillOpacity="0.3" stroke={col} strokeWidth="0.8" />
                   {/* Mast */}
-                  <line x1={ship.x} y1={ship.y - 4} x2={ship.x} y2={ship.y - 10}
-                    stroke={col} strokeWidth="1" opacity="0.8" />
-                  {/* SAM launcher dots */}
-                  {!depleted && [0,1,2].map(i => (
-                    <circle key={i} cx={ship.x - 5 + i * 5} cy={ship.y - 2} r="1.2"
-                      fill={col} opacity="0.7" />
+                  <line x1={ship.x + 1} y1={ship.y - 7} x2={ship.x + 1} y2={ship.y - 14}
+                    stroke={col} strokeWidth="1" opacity="0.9" />
+                  <line x1={ship.x - 3} y1={ship.y - 12} x2={ship.x + 5} y2={ship.y - 12}
+                    stroke={col} strokeWidth="0.8" opacity="0.7" />
+                  {/* SAM launcher turrets */}
+                  {!depleted && [-8, 6].map(ox => (
+                    <g key={ox}>
+                      <circle cx={ship.x + ox} cy={ship.y} r="2.5"
+                        fill={col} fillOpacity="0.4" stroke={col} strokeWidth="0.8" />
+                      <line x1={ship.x + ox} y1={ship.y} x2={ship.x + ox} y2={ship.y - 5}
+                        stroke={col} strokeWidth="1.2" opacity="0.9" />
+                    </g>
                   ))}
-                  <text x={ship.x} y={ship.y + 16} fill={col} fontSize="6.5"
-                    textAnchor="middle" opacity="0.85">{ship.name}</text>
-                  <text x={ship.x} y={ship.y + 24} fill={depleted ? "#f87171" : "rgba(56,189,248,0.6)"}
-                    fontSize="6" textAnchor="middle">
-                    {depleted ? "NO SAMs" : `${ship.sam_count} SAMs`}
+                  <text x={ship.x} y={ship.y + 18} fill={col} fontSize="7"
+                    textAnchor="middle" fontWeight="bold" opacity="0.9">{ship.name}</text>
+                  <text x={ship.x} y={ship.y + 27} fill={depleted ? "#f87171" : "rgba(56,189,248,0.65)"}
+                    fontSize="6.5" textAnchor="middle">
+                    {depleted ? "⚠ NO SAMs" : `SAM ×${ship.sam_count}`}
                   </text>
                 </g>
               );
@@ -1006,6 +1244,9 @@ export default function App() {
                 ? dwnAge * 11
                 : Math.atan2(th.vy, th.vx) * 180 / Math.PI + 90;
 
+              // Hit threats are handled by the city explosion + city flash — don't double-render
+              if (th.hit) return null;
+
               // Undetected: render as anonymous radar blip — operator sees contact but doesn't know type/target
               if (!th.detected && !th.intercepted) {
                 const blipR = 4 + 2 * Math.sin(th.age * 0.18);
@@ -1057,23 +1298,29 @@ export default function App() {
 
             {/* Explosion bursts */}
             {explosions.map(e => {
-              const p = e.age / 55;
-              const flash = e.age < 8;
+              const dur = e.cityHit ? 90 : 55;
+              const p = e.age / dur;
+              const flash = e.age < (e.cityHit ? 14 : 8);
+              const s = e.cityHit ? 3.5 : 1;  // city strikes are much larger
               return (
                 <g key={e.id} transform={`translate(${e.x},${e.y})`}>
-                  {flash && <circle r={20 - e.age * 1.5} fill="#ffffff" opacity={(8 - e.age) / 8 * 0.9} />}
-                  <circle r={4 + p * 34} fill="none" stroke="#facc15" strokeWidth={2.5 * (1-p)} opacity={(1-p) * 0.9} />
-                  <circle r={2 + p * 22} fill="none" stroke="#f87171" strokeWidth={2 * (1-p)} opacity={(1-p) * 0.7} />
-                  <circle r={p * 12} fill="none" stroke="#ff8855" strokeWidth={1.5 * (1-p)} opacity={(1-p) * 0.5} />
-                  {[0,60,120,180,240,300].map(angle => {
+                  {flash && <circle r={(e.cityHit ? 40 : 20) - e.age * (e.cityHit ? 2 : 1.5)} fill="#ffffff" opacity={(( e.cityHit ? 14 : 8) - e.age) / (e.cityHit ? 14 : 8) * 0.95} />}
+                  {e.cityHit && flash && <circle r={30 - e.age} fill="#ff6600" opacity={0.5} />}
+                  <circle r={4*s + p * 34*s} fill="none" stroke="#facc15" strokeWidth={2.5*s * (1-p)} opacity={(1-p) * 0.9} />
+                  <circle r={2*s + p * 22*s} fill="none" stroke="#f87171" strokeWidth={2*s * (1-p)} opacity={(1-p) * 0.8} />
+                  <circle r={p * 12*s} fill="none" stroke="#ff8855" strokeWidth={1.5*s * (1-p)} opacity={(1-p) * 0.5} />
+                  {(e.cityHit ? [0,30,60,90,120,150,180,210,240,270,300,330] : [0,60,120,180,240,300]).map(angle => {
                     const rad = angle * Math.PI / 180;
-                    const dist = p * 28;
+                    const dist = p * 28 * s;
                     return (
                       <circle key={angle}
                         cx={Math.cos(rad) * dist} cy={Math.sin(rad) * dist}
-                        r={Math.max(0, 2 - p * 1.5)} fill="#facc15" opacity={1-p} />
+                        r={Math.max(0, (e.cityHit ? 3 : 2) - p * 1.5)} fill="#facc15" opacity={1-p} />
                     );
                   })}
+                  {e.cityHit && e.age > 5 && e.age < 40 && (
+                    <text y={-40 - p * 20} fill="#f87171" fontSize="9" textAnchor="middle" fontWeight="bold" opacity={1-p}>CITY HIT</text>
+                  )}
                 </g>
               );
             })}
@@ -1215,7 +1462,6 @@ export default function App() {
                 const totalEta  = p.threat.eta || 600;
                 const remaining = Math.max(0, totalEta - elapsed);
                 const etaColor  = remaining < 120 ? "#f87171" : remaining < 300 ? "#facc15" : "#4ade80";
-                const autoIn    = Math.max(0, remaining - 90);
                 const isCapital = p.threat?.target_name === "Arktholm";
                 return (
                   <div key={p.decision_id}
@@ -1248,8 +1494,8 @@ export default function App() {
                       <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 8 }}>
                         <div style={{ fontSize: 7, color: "#7a6a30", letterSpacing: 1, marginBottom: 1 }}>IMPACT IN</div>
                         <div style={{ fontSize: 24, fontWeight: "bold", color: etaColor, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>{formatETA(remaining)}</div>
-                        <div style={{ fontSize: 7, color: autoIn > 0 ? "#7a6a30" : "#f87171", marginTop: 2 }}>
-                          {autoIn > 0 ? `auto ${formatETA(autoIn)}` : "AUTO-EXECUTING"}
+                        <div style={{ fontSize: 7, color: remaining < 60 ? "#f87171" : "#7a6a30", marginTop: 2, fontWeight: remaining < 60 ? "bold" : "normal" }}>
+                          {remaining < 60 ? "⚠ CRITICAL — DECIDE NOW" : "AWAITING DECISION"}
                         </div>
                       </div>
                     </div>
@@ -1522,6 +1768,48 @@ export default function App() {
           {/* Base status */}
           {tab === "state" && (
             <div style={{ flex: 1, overflowY: "auto", padding: 14 }}>
+              {/* ── Naval fleet status ── */}
+              <div style={{ marginBottom: 14, padding: 10, border: "1px solid #0d2238", background: "#0a1e30" }}>
+                <div style={{ fontSize: 7, color: "#1e4a60", letterSpacing: 2, marginBottom: 8 }}>NAVAL FLEET — BOREAL PASSAGE</div>
+                {shipStatus.map(ship => {
+                  const samPct = Math.round((ship.sam_count / 12) * 100);
+                  const ciwsPct = Math.round(((ship.ciws_rounds ?? 200) / 200) * 100);
+                  const destroyed = ship.sam_count === 0 && (ship.ciws_rounds ?? 200) === 0;
+                  const damaged = !destroyed && ship.sam_count < 6;
+                  const col = destroyed ? "#f87171" : damaged ? "#f97316" : "#38bdf8";
+                  return (
+                    <div key={ship.id} style={{ marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid #0a1820" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                        <span style={{ fontSize: 8, fontWeight: "bold", color: col, letterSpacing: 1 }}>{ship.id}</span>
+                        <span style={{ fontSize: 7.5, color: destroyed ? "#f87171" : damaged ? "#f97316" : "#4ade80" }}>
+                          {destroyed ? "⚠ DESTROYED" : damaged ? "DAMAGED" : "ACTIVE"}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 7.5, color: "#3a6070", marginBottom: 5 }}>{ship.name}</div>
+                      <div style={{ marginBottom: 3 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 1 }}>
+                          <span style={{ fontSize: 7, color: "#2a5570" }}>SAM MISSILES</span>
+                          <span style={{ fontSize: 7.5, color: col }}>{ship.sam_count} / 12</span>
+                        </div>
+                        <div style={{ height: 3, background: "#0d2238", borderRadius: 2 }}>
+                          <div style={{ width: `${samPct}%`, height: "100%", background: col, borderRadius: 2, transition: "width 0.4s" }} />
+                        </div>
+                      </div>
+                      <div>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 1 }}>
+                          <span style={{ fontSize: 7, color: "#2a5570" }}>CIWS ROUNDS</span>
+                          <span style={{ fontSize: 7.5, color: "#fb923c" }}>{ship.ciws_rounds ?? 200} / 200</span>
+                        </div>
+                        <div style={{ height: 3, background: "#0d2238", borderRadius: 2 }}>
+                          <div style={{ width: `${ciwsPct}%`, height: "100%", background: "#fb923c", borderRadius: 2, transition: "width 0.4s" }} />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* ── Air bases ── */}
               {(northStatus.length > 0 ? northStatus : BASES.north.map(b => ({ ...b, available: [], deployed: [] }))).map(base => (
                 <div key={base.id} style={{ marginBottom: 14, padding: 10, border: "1px solid #0d1e2a", background: "#112538" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
